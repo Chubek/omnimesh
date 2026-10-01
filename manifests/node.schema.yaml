@@ -1,0 +1,10 @@
+$schema: https://json-schema.org/draft/2020-12/schema
+$id: https://omnimesh.io/schemas/node/v1alpha1
+title: Node schema
+type: object
+additionalProperties: false
+required: [apiVersion, kind]
+properties:
+  apiVersion: {const: omnimesh.io/v1alpha1}
+  kind: {const: Node}
+  spec: {type: object, additionalProperties: false, description: Unsupported capabilities must be rejected.}

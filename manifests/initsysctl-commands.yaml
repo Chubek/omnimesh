@@ -1,0 +1,13 @@
+apiVersion: omnimesh.io/v1alpha1
+kind: InitsysctlCommandManifest
+commands:
+  - name: kill
+    status: unsupported
+    arguments: [signal, pattern]
+  - name: trace
+    status: unsupported
+    arguments: [pattern]
+  - name: reboot
+    status: unsupported
+  - name: exit
+    status: unsupported
