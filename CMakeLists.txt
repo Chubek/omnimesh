@@ -22,6 +22,8 @@ add_library(omnimesh-core STATIC
   src/common/status.cpp
   src/common/model.cpp
   src/common/module.cpp
+  src/common/sha256.cpp
+  src/common/gzip.cpp
   src/control-plane/admission/module.cpp
   src/control-plane/allocator/module.cpp
   src/control-plane/api/module.cpp
@@ -38,6 +40,7 @@ add_library(omnimesh-core STATIC
   src/supporting/admin/module.cpp
   src/supporting/identity/module.cpp
   src/supporting/images/module.cpp
+  src/supporting/images/tar.cpp
   src/supporting/telemetry/module.cpp
   src/runtime/omnibuild/module.cpp
   src/runtime/omnirun/module.cpp

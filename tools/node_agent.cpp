@@ -66,8 +66,11 @@ int run(int argc, char **argv) {
                  "/trusted/rootfs\n"
                  "  --state-dir /fresh/private/session [--timeout-ms 60000] "
                  "[--grace-ms 1000]\n"
+                 "  [--journal-dir /durable/journal]\n"
                  "Foreground local OCI execution. Rootfs is "
-                 "administrator-provisioned.\n";
+                 "administrator-provisioned. A journal directory enables "
+                 "durable recording of control-plane facts before use; "
+                 "recover it with `omnimesh recover`.\n";
     return 0;
   }
   if (argc < 3 || std::string_view(argv[1]) != "run") {
@@ -80,7 +83,7 @@ int run(int argc, char **argv) {
     if (i + 1 >= argc ||
         (key != "--node" && key != "--runtime" && key != "--rootfs" &&
          key != "--state-dir" && key != "--timeout-ms" &&
-         key != "--grace-ms") ||
+         key != "--grace-ms" && key != "--journal-dir") ||
         !arguments.emplace(key, argv[i + 1]).second) {
       return fail({StatusCode::invalid_argument,
                    "unknown, missing or duplicate execution option"});
@@ -96,6 +99,9 @@ int run(int argc, char **argv) {
   options.runtime_executable = arguments.at("--runtime");
   options.rootfs = arguments.at("--rootfs");
   options.state_directory = arguments.at("--state-dir");
+  if (arguments.count("--journal-dir")) {
+    options.journal_directory = arguments.at("--journal-dir");
+  }
   if ((arguments.count("--timeout-ms") &&
        !integer(arguments.at("--timeout-ms"), options.timeout_millis)) ||
       (arguments.count("--grace-ms") &&
@@ -141,6 +147,8 @@ int run(int argc, char **argv) {
                 {"image", workload.value.image}}},
               {"sessionDirectory", result.session_directory},
               {"reservationsRetained", result.reservations_retained},
+              {"journaled", result.journaled},
+              {"journalRecords", result.journal_records},
               {"tasks", Json::array()},
               {"workers", Json::array()}};
   for (const auto &task : result.workload.tasks) {

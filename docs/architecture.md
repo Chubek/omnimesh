@@ -82,15 +82,23 @@ not distributed fencing or a durable allocation database.
 
 `Journal` provides bounded, single-writer version-one event framing and rejects
 complete corruption before replay. `DurableControlPlane` revalidates manifests
-and restores manually recorded reservations as Unknown. Neither CLI uses this
-interface; live controller mutations are not transactionally journaled. Recovery
-failure forbids scheduling against its partially reconstructed state.
+and restores recorded reservations as Unknown. `plan` and the local node agent
+record facts before the mutations and external operations they describe and
+fail closed on recording errors; `omnimesh recover` replays a journal into
+fresh memory for inspection. Reservations committed inside `reconcile` are
+recorded after the commit but before any start intent or runtime use, so
+recovery restores only recorded facts. Recovery failure forbids scheduling
+against its partially reconstructed state.
 
 ## Planned subsystems
 
-Artifact and spool storage, OCI image loading, distributed networking, discovery
+Registry access, distributed networking, discovery
 and membership, API authentication, transactional persistent controllers,
 controller failover, telemetry, extensions, and Omnibuild/OmniVMM/Omnix/Initsys/
 Meshbox remain unimplemented. The Omnirun boundary now contains a local OCI
-runtime adapter. `docs/status.md` and `docs/second-regiment.md` document tested
-behavior, compatibility limitations and manual recovery.
+runtime adapter, the execution plane contains a content-addressed artifact
+spool with no worker input wiring, and supporting services contain a local
+image-layout loader with no registry behind it. `docs/status.md`,
+`docs/third-regiment.md`, `docs/fourth-regiment.md` and
+`docs/fifth-regiment.md` document tested behavior, compatibility limitations
+and manual recovery.

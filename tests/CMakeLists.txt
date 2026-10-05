@@ -1,4 +1,4 @@
-foreach(suite manifest allocator scheduler orchestrator storage)
+foreach(suite manifest allocator scheduler orchestrator storage artifacts images)
   add_executable(omnimesh-test-${suite} unit/${suite}.cpp)
   target_link_libraries(omnimesh-test-${suite} PRIVATE omnimesh-core omnimesh-json)
   target_compile_options(omnimesh-test-${suite} PRIVATE -Wall -Wextra -Wpedantic)
@@ -25,6 +25,7 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND OMNIMESH_HAVE_SPAWN_CLOSEFROM)
   set_tests_properties(execution PROPERTIES TIMEOUT 45)
 
   add_test(NAME agent-cli COMMAND ${CMAKE_COMMAND}
+    -DCLI=$<TARGET_FILE:omnimesh>
     -DNODE_AGENT=$<TARGET_FILE:omnimesh-node-agent>
     -DFAKE_RUNTIME=$<TARGET_FILE:omnimesh-fake-runtime>
     -DSOURCE_DIR=${PROJECT_SOURCE_DIR}

@@ -32,6 +32,10 @@ struct LocalExecutionOptions {
   std::string state_directory;
   std::uint32_t timeout_millis{60000}; // Whole session, including retries.
   std::uint32_t grace_millis{1000};
+  // Empty disables durable recording. When set, control-plane facts are
+  // recorded to this directory before the mutations and external operations
+  // they describe; a journal failure stops the session fail-closed.
+  std::string journal_directory;
 };
 struct WorkerResult {
   std::string attempt_id;
@@ -46,10 +50,17 @@ struct LocalExecutionResult {
   std::vector<WorkerResult> workers;
   bool reservations_retained{false};
   std::string session_directory;
+  bool journaled{false};
+  std::uint64_t journal_records{0};
 };
 // Foreground local agent; one active worker at a time, replicas queue. Caller
 // is a trusted local administrator. Callback is checked between bounded
-// operations.
+// operations. When LocalExecutionOptions::journal_directory is set, node,
+// quota, workload, reservation, cancellation and observation facts are recorded
+// before the allocator/controller mutation or runtime operation they describe,
+// and any recording failure cancels desired state and ends the session. A
+// recovered journal restores active attempts as Unknown; historic observations
+// never prove current liveness.
 LocalExecutionResult execute_local(const Workload &workload, const Node &node,
                                    const LocalExecutionOptions &options,
                                    const std::function<bool()> &cancelled = {});

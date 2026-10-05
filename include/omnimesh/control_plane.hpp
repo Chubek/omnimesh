@@ -26,13 +26,16 @@ struct RecoveryReport {
   bool status{false};
 };
 
-// Experimental, manually recorded control-plane event journal. Callers must
-// record facts before issuing external operations; this interface does not wrap
-// allocator/controller mutations transactionally and is not wired to the CLI.
-// Recovery requires fresh state; a failed RecoveryReport forbids scheduling.
+// Durable control-plane event journal, now wired into the CLIs: `plan` and
+// the local node agent record facts before the mutations and external
+// operations they describe, and `omnimesh recover` replays a journal into
+// fresh memory. Recovery requires fresh state; a failed recovery forbids
+// scheduling and its partial state is discarded with the local objects.
 // Active recovered attempts remain Unknown until fresh node observations
 // arrive. A file lock excludes concurrent writers; no distributed leases or
-// fencing exist.
+// fencing exist. Reservations committed inside reconcile are recorded after
+// the commit but before any start intent or runtime use, so recovery restores
+// only what was recorded and never assumes completeness.
 class DurableControlPlane {
 public:
   Status open(const std::string &directory);

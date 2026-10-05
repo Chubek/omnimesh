@@ -1,8 +1,10 @@
 #include "omnimesh/execution.hpp"
+#include "omnimesh/control_plane.hpp"
 #include <algorithm>
 #include <fcntl.h>
 #include <filesystem>
 #include <limits>
+#include <set>
 #include <sys/file.h>
 #include <sys/stat.h>
 #include <sys/utsname.h>
@@ -85,9 +87,21 @@ LocalExecutionResult execute_local(const Workload &workload, const Node &node,
   Allocator allocator;
   WorkloadController controller(allocator);
   LocalAuthority authority;
+  DurableControlPlane durable;
+  const bool journal = !options.journal_directory.empty();
+  std::set<std::string> journaled_attempts;
+  bool cancel_recorded = false;
   const auto workload_id = workload.tenant + "/" + workload.name;
   auto finish = [&](Status status) {
     result.status = std::move(status);
+    if (journal) {
+      result.journaled = true;
+      result.journal_records = durable.stats().records;
+      const auto closed = durable.close();
+      if (!closed.ok() && result.status.ok()) {
+        result.status = closed;
+      }
+    }
     controller.inspect(workload_id, workload.tenant, result.workload);
     const auto snapshot = allocator.snapshot();
     const auto tenant = snapshot.tenants.find(workload.tenant);
@@ -97,6 +111,15 @@ LocalExecutionResult execute_local(const Workload &workload, const Node &node,
       authority.clear();
     }
     return result;
+  };
+  // Records cancellation before the controller mutation it describes. A
+  // recording failure ends the session fail-closed without cancelling.
+  auto note_cancellation = [&]() -> Status {
+    if (!journal || cancel_recorded) {
+      return Status::Ok();
+    }
+    cancel_recorded = true;
+    return durable.record_cancellation(workload_id);
   };
   if (options.timeout_millis == 0 || options.timeout_millis > 3600000 ||
       options.grace_millis > 60000 ||
@@ -113,11 +136,48 @@ LocalExecutionResult execute_local(const Workload &workload, const Node &node,
     return finish({StatusCode::unavailable,
                    "node architecture does not match this host"});
   }
-  auto status = allocator.upsert_node(node);
+  auto status = Status::Ok();
+  if (journal) {
+    // The journal directory must not be the session directory: opening it
+    // creates it, and the session directory is required to be fresh.
+    std::error_code path_error;
+    const auto journal_path =
+        std::filesystem::weakly_canonical(options.journal_directory, path_error);
+    const bool journal_path_ok = !path_error;
+    const auto state_guess = std::filesystem::weakly_canonical(
+        options.state_directory, path_error);
+    if (!journal_path_ok || path_error || journal_path == state_guess) {
+      return finish({StatusCode::invalid_argument,
+                     "journal directory must be usable and differ from the "
+                     "session state directory"});
+    }
+    status = durable.open(options.journal_directory);
+    if (!status.ok()) {
+      return finish(status);
+    }
+    // Facts are recorded before the mutations they describe; recovery replays
+    // them in order and restores active attempts as Unknown.
+    status = durable.record_node(node);
+    if (!status.ok()) {
+      return finish(status);
+    }
+  }
+  status = allocator.upsert_node(node);
   if (!status.ok()) {
     return finish(status);
   }
-  status = allocator.set_quota(workload.tenant, {node.capacity, 1});
+  const TenantQuota session_quota{node.capacity, 1};
+  if (journal) {
+    status = durable.record_quota(workload.tenant, session_quota);
+    if (!status.ok()) {
+      return finish(status);
+    }
+    status = durable.record_workload(workload);
+    if (!status.ok()) {
+      return finish(status);
+    }
+  }
+  status = allocator.set_quota(workload.tenant, session_quota);
   if (!status.ok()) {
     return finish(status);
   }
@@ -187,6 +247,10 @@ LocalExecutionResult execute_local(const Workload &workload, const Node &node,
   while (true) {
     if (MonotonicClock::now() >= deadline || (cancelled && cancelled())) {
       session_cancelled = true;
+      status = note_cancellation();
+      if (!status.ok()) {
+        return finish(status);
+      }
       status = controller.cancel(workload_id, workload.tenant);
       if (!status.ok()) {
         return finish(status);
@@ -200,6 +264,28 @@ LocalExecutionResult execute_local(const Workload &workload, const Node &node,
     status = controller.inspect(workload_id, workload.tenant, record);
     if (!status.ok()) {
       return finish(status);
+    }
+    if (journal) {
+      // Reservations are committed inside reconcile; they are recorded here,
+      // before any start intent or runtime operation for the new attempt. A
+      // crash between commit and this record loses the fact, so recovery can
+      // only restore what was recorded, never assume completeness.
+      for (const auto &item : record.tasks) {
+        if (item.state != TaskState::allocated || item.attempts.empty()) {
+          continue;
+        }
+        const auto &latest = item.attempts.back();
+        if (!journaled_attempts.insert(latest.id).second) {
+          continue;
+        }
+        status = durable.record_reservation(item.id, latest.node_id,
+                                            latest.number, latest.generation);
+        if (!status.ok()) {
+          note_cancellation();
+          controller.cancel(workload_id, workload.tenant);
+          return finish(status);
+        }
+      }
     }
     if (std::all_of(
             record.tasks.begin(), record.tasks.end(),
@@ -252,14 +338,24 @@ LocalExecutionResult execute_local(const Workload &workload, const Node &node,
         result.session_directory + "/bundle-" + std::to_string(ordinal);
     status = prepare_bundle(workload, allocation, rootfs.string(), bundle);
     if (!status.ok()) {
+      const auto failure = status;
+      status = note_cancellation();
+      if (!status.ok()) {
+        return finish(status);
+      }
       controller.cancel(workload_id,
                         workload.tenant); // No start intent was issued.
-      return finish(status);
+      return finish(failure);
     }
     status = authority.mark(result.session_directory);
     if (!status.ok()) {
+      const auto failure = status;
+      status = note_cancellation();
+      if (!status.ok()) {
+        return finish(status);
+      }
       controller.cancel(workload_id, workload.tenant);
-      return finish(status);
+      return finish(failure);
     }
     status = controller.begin_start(attempt.id, workload.tenant);
     if (!status.ok()) {
@@ -268,8 +364,15 @@ LocalExecutionResult execute_local(const Workload &workload, const Node &node,
     std::uint64_t sequence = 0;
     auto observe = [&](AttemptState state, bool retryable = false,
                        int exit = 0) {
-      return controller.observe({attempt.id, node.id, attempt.generation,
-                                 ++sequence, state, retryable, exit});
+      const Observation observation{attempt.id, node.id, attempt.generation,
+                                   ++sequence, state, retryable, exit};
+      if (journal) {
+        const auto recorded = durable.record_observation(observation);
+        if (!recorded.ok()) {
+          return recorded;
+        }
+      }
+      return controller.observe(observation);
     };
     ChildProcess child;
     status = runtime.launch(worker.container_id, bundle, child);
@@ -300,7 +403,10 @@ LocalExecutionResult execute_local(const Workload &workload, const Node &node,
       if (!stopping && (now >= deadline || (cancelled && cancelled()))) {
         session_cancelled = true;
         stopping = true;
-        status = controller.cancel(workload_id, workload.tenant);
+        status = note_cancellation();
+        if (status.ok()) {
+          status = controller.cancel(workload_id, workload.tenant);
+        }
         if (!status.ok()) {
           break;
         }
@@ -384,7 +490,13 @@ LocalExecutionResult execute_local(const Workload &workload, const Node &node,
       return finish(status);
     }
     if (cleanup_failed) {
-      controller.cancel(workload_id, workload.tenant);
+      status = note_cancellation();
+      if (status.ok()) {
+        status = controller.cancel(workload_id, workload.tenant);
+      }
+      if (!status.ok()) {
+        return finish(status);
+      }
       return finish(
           {StatusCode::unavailable, "container stopped; cleanup failed and "
                                     "further execution was cancelled"});

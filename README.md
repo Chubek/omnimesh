@@ -1,9 +1,10 @@
 # OmniMesh
 
 OmniMesh is a distributed execution platform built around OCI-compatible
-container execution and image distribution. The second implementation
-regiment adds experimental local OCI execution to the tested control-plane
-planning path. See [the regiment contract](docs/second-regiment.md).
+container execution and image distribution. The fifth implementation
+regiment adds digest-verified local image loading alongside the
+content-addressed spool and the journaled planning and execution paths.
+See [the regiment contract](docs/fifth-regiment.md).
 
 ## Build and test
 
@@ -18,8 +19,14 @@ ctest --test-dir build --output-on-failure
 ```
 
 Test suites: `smoke`, `manifest`, `allocator`, `scheduler`, `orchestrator`, `storage`,
-`process`, `execution`, `cli`, and `agent-cli`. The optional `oci-runtime` test
-skips unless a real runtime and rootfs are explicitly configured.
+`process`, `execution`, `artifacts`, `images`, `cli`, and `agent-cli`. The optional `oci-runtime` test
+skips unless a real runtime and rootfs are explicitly configured. Journaled planning
+and execution are covered by cases in `execution`, `cli` and `agent-cli`; the spool
+is covered by `artifacts` and `artifact` cases in `cli`; image loading is covered
+by `images` and `image` cases in `cli`. See
+[the durable-execution contract](docs/third-regiment.md),
+[the spool contract](docs/fourth-regiment.md) and
+[the image contract](docs/fifth-regiment.md).
 
 ## What works
 
@@ -33,6 +40,14 @@ reservation, and task/attempt reconciliation are implemented in
 | `omnimesh validate WORKLOAD.json` | Validate a workload manifest. |
 | `omnimesh validate-node NODE.json` | Validate a node inventory document. |
 | `omnimesh plan WORKLOAD.json --node NODE.json [...] [--quota CPU MEM MAX_ALLOC]` | Admission plus placement dry run. |
+| `omnimesh plan ... --journal-dir DIR` | Dry run that also records planning facts for later recovery. |
+| `omnimesh recover --journal-dir DIR` | Replay a journal into fresh memory and report the outcome. |
+| `omnimesh artifact put FILE --spool-dir DIR --tenant TENANT` | Hash, verify and publish a content-addressed blob. |
+| `omnimesh artifact get DIGEST --spool-dir DIR --tenant TENANT --out FILE` | Re-verify and fetch a blob by digest. |
+| `omnimesh artifact list --spool-dir DIR` | List spool contents, usage and recovery notes. |
+| `omnimesh artifact gc --spool-dir DIR [--keep DIGEST ...]` | Remove unreferenced blobs and report reclaimed bytes. |
+| `omnimesh image inspect --layout DIR [--platform OS/ARCH] [--digest DIGEST]` | Validate a local OCI layout and report the selected manifest. |
+| `omnimesh image unpack --layout DIR --rootfs OUT [--platform OS/ARCH] [--digest DIGEST]` | Verify and extract layers into a fresh rootfs. |
 
 Validation, planning and execution results emit JSON on stdout. Commands return
 `0` on success, `2` for invalid input or usage, `3` for unavailable or denied
@@ -59,28 +74,64 @@ Contracts are documented in `manifests/workload.schema.yaml` and
 build/omnimesh-node-agent run manifests/example-workload.json \
   --node manifests/example-node.json \
   --runtime /usr/bin/crun --rootfs /absolute/path/to/provisioned-rootfs \
-  --state-dir /absolute/path/to/fresh-session
+  --state-dir /absolute/path/to/fresh-session \
+  --journal-dir /absolute/path/to/journal
 ```
 
 The foreground agent supervises one worker at a time, preserves retry history,
 captures bounded output and handles cancellation. It confirms runtime termination
 before releasing reservations. Uncertain termination blocks further sessions for
-the host user until manual recovery. The administrator supplies and verifies the
+the host user until manual recovery. With `--journal-dir` it records
+control-plane facts before acting on them and fails closed on recording errors;
+`omnimesh recover` replays the journal without restarting work. The administrator
+supplies and verifies the
 rootfs; image digest annotations do not verify its contents. This profile is
 experimental and has no OCI conformance claim. See
-[execution and recovery details](docs/second-regiment.md).
+[execution and recovery details](docs/third-regiment.md).
+
+## Artifact spool
+
+```sh
+omnimesh artifact put input.bin --spool-dir /absolute/path/to/spool --tenant local
+omnimesh artifact get sha256:<64 hex> --spool-dir /absolute/path/to/spool \
+  --tenant local --out output.bin
+omnimesh artifact list --spool-dir /absolute/path/to/spool
+omnimesh artifact gc --spool-dir /absolute/path/to/spool --keep sha256:<64 hex>
+```
+
+The local spool publishes immutable content-addressed blobs, re-hashes on
+every fetch, enforces tenant labels and quotas, and collects unreferenced
+blobs on demand. Tampered blobs fail closed and are preserved. Workload
+manifests declare no artifact inputs and nothing stages spool blobs into
+workers; registry access and cross-node transfer remain later work. See
+[the spool contract](docs/fourth-regiment.md).
+
+## Image loading
+
+```sh
+omnimesh image unpack --layout /absolute/path/to/layout \
+  --rootfs /absolute/path/to/fresh-rootfs --platform linux/amd64
+```
+
+Local OCI layouts validate exactly: platform selection with optional digest
+pinning, per-blob digest verification while streaming, diff-ID chain checks,
+and root-confined extraction that refuses escapes, strips privileges and
+honors whiteouts. The administrator can provision `--rootfs` from a verified
+unpack instead of by hand. No registry, signatures, Docker formats or zstd
+layers. See [the image contract](docs/fifth-regiment.md).
 
 ## Remaining boundaries
 
-Image loading, artifact transfer, distributed transports, authentication,
+Registry access, image building, artifact transfer, distributed transports, authentication,
 discovery, membership, telemetry, controller failover, VMM, Omnix, Initsys,
 Meshbox, Frantz, native plugin loading and Lua execution remain unimplemented.
 `omnimesh-core` is a static library; the plugin headers declare an interface
 with no loader.
 
-`WorkloadController` and `Allocator` remain process-local. A separately callable,
-experimental journal can reconstruct recorded control-plane facts; neither CLI
-uses it and no API transactionally journals their live mutations. Local execution
+`WorkloadController` and `Allocator` remain process-local. The CLIs record
+journaled facts before acting on them and `omnimesh recover` replays a journal
+into fresh memory, but live mutations are not transactionally wrapped inside
+their locks. Local execution
 uses a host-user lock and conservative recovery barrier. There are no distributed
 leases or fencing tokens. See [implementation status](docs/status.md).
 

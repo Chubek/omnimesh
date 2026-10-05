@@ -47,3 +47,18 @@ if(NOT barrier STREQUAL "${state}-unknown\n")
   message(FATAL_ERROR "Unexpected recovery barrier; leave it for its owner: ${barrier}")
 endif()
 file(WRITE "${authority}" "")
+# Journaled execution records facts before use; `omnimesh recover` replays them.
+string(RANDOM LENGTH 16 ALPHABET 0123456789abcdef journal_session)
+set(journal_dir "${TEST_DIR}/journal-${journal_session}")
+run_agent(0 run "${TEST_DIR}/workload.json"
+  --node "${SOURCE_DIR}/manifests/example-node.json" --runtime "${FAKE_RUNTIME}"
+  --rootfs "${TEST_DIR}/rootfs" --state-dir "${TEST_DIR}/session-${journal_session}"
+  --journal-dir "${journal_dir}")
+if(NOT last_output MATCHES "\"journaled\": true" OR NOT last_output MATCHES "\"state\": \"Succeeded\"")
+  message(FATAL_ERROR "Journaled execution failed: ${last_output}")
+endif()
+execute_process(COMMAND "${CLI}" recover --journal-dir "${journal_dir}"
+  RESULT_VARIABLE result OUTPUT_VARIABLE output ERROR_VARIABLE errors TIMEOUT 15)
+if(NOT result EQUAL 0 OR NOT output MATCHES "\"reservationsRecovered\": 2")
+  message(FATAL_ERROR "Journal recovery failed: ${output}${errors}")
+endif()

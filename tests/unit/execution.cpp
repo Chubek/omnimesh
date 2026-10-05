@@ -1,4 +1,5 @@
 #include "omnimesh/execution.hpp"
+#include "omnimesh/control_plane.hpp"
 #include "test_support.hpp"
 #include <filesystem>
 #include <fstream>
@@ -39,7 +40,7 @@ struct Fixture {
   }
   LocalExecutionOptions options(const std::string &runtime,
                                 const std::string &suffix = "session") {
-    return {runtime, root + "/rootfs", root + "/" + suffix, 5000, 20};
+    return {runtime, root + "/rootfs", root + "/" + suffix, 5000, 20, {}};
   }
 };
 Node node() {
@@ -131,6 +132,42 @@ void execution(const std::string &runtime) {
   CHECK(retried.workload.tasks[0].attempts.size() == 2);
   CHECK(retried.workload.tasks[0].attempts[0].state == AttemptState::failed);
   CHECK(retried.workload.tasks[0].attempts[1].state == AttemptState::succeeded);
+}
+void journaled_execution(const std::string &runtime) {
+  Fixture fixture;
+  auto workload = spec("args");
+  workload.replicas = 2;
+  auto options = fixture.options(runtime, "session-j");
+  options.journal_directory = fixture.root + "/journal";
+  const auto result = execute_local(workload, node(), options);
+  CHECK(result.status.ok());
+  CHECK(result.journaled);
+  CHECK(result.journal_records > 0);
+  CHECK(!result.reservations_retained);
+  // A fresh control plane replays the recorded facts; terminal observations
+  // restore the finished states without restarting any work.
+  DurableControlPlane reader;
+  CHECK(reader.open(options.journal_directory).ok());
+  Allocator allocator;
+  WorkloadController controller(allocator);
+  const auto report = reader.recover(allocator, controller);
+  CHECK(report.status);
+  CHECK(report.reservations_recovered == 2);
+  CHECK(report.observations_recovered >= 2);
+  WorkloadRecord record;
+  CHECK(controller.inspect("local/hello", "local", record).ok());
+  CHECK(record.tasks[0].state == TaskState::succeeded);
+  CHECK(record.tasks[0].attempts.back().observation_sequence > 0);
+  CHECK(record.tasks[1].state == TaskState::succeeded);
+  CHECK(allocator.snapshot().tenants.at("local").active_allocations == 0);
+  CHECK(reader.close().ok());
+  // An invalid journal directory fails before any mutation or worker starts.
+  auto bad = fixture.options(runtime, "bad-journal");
+  bad.journal_directory = "/proc/omnimesh-test-journal";
+  const auto rejected = execute_local(workload, node(), bad);
+  CHECK(!rejected.status.ok());
+  CHECK(rejected.workers.empty());
+  CHECK(!std::filesystem::exists(bad.state_directory));
 }
 void failures(const std::string &runtime) {
   Fixture fixture;
@@ -287,6 +324,7 @@ int main(int argc, char **argv) {
   return test::run([&] {
     bundle_validation();
     execution(argv[1]);
+    journaled_execution(argv[1]);
     failures(argv[1]);
     cancellation(argv[1]);
     crash_barrier(argv[1], argv[2]);

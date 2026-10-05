@@ -43,8 +43,35 @@ start; cancellation that retains reservations for `Starting`, `Running` and
 `Allocated` attempts. Bounded by 128 workloads, 4096 tasks and 8192 allocation
 records. Backoff uses monotonic time with stable per-attempt jitter.
 
-**CLI** — `tools/main.cpp`. `validate`, `validate-node` and `plan` with JSON
-output and documented exit codes.
+**CLI** — `tools/main.cpp`. `validate`, `validate-node`, `plan`
+(`--journal-dir` records planning facts for later recovery), `recover`
+(replays a journal into fresh memory and reports the outcome), `artifact`
+(`put/get/list/gc` for the content-addressed spool) and `image`
+(`inspect/unpack` for local OCI layouts) with JSON output and
+documented exit codes.
+
+**Artifact and spool storage** — `src/execution-plane/artifacts/module.cpp`,
+`src/common/sha256.cpp` and `tools/main.cpp` (`artifact put/get/list/gc`).
+Content-addressed local spool with in-tree SHA-256: streaming hash-while-write
+at publish, mandatory re-hash at fetch, atomic synced publication, 64 MiB
+per-blob and 256 MiB/1024-blob default quotas, tenant labels enforced on
+fetch, index rebuild by re-hashing on open, and `gc` with reclaimed-byte
+accounting. Tampered blobs fail closed and are preserved, never served.
+Workload-declared inputs, registry access, image loading and cross-node
+transfer are not implemented.
+
+**Image loading and verification** — `src/supporting/images/module.cpp`,
+`src/supporting/images/tar.cpp`, `src/common/gzip.cpp` and `tools/main.cpp`
+(`image inspect/unpack`). Local OCI image-layout validation with exact
+media-type matches, platform selection and optional manifest pinning; every
+blob verified by digest while streaming and every layer matched against its
+diff ID. In-tree DEFLATE/gzip decoder with incremental bounds and trailer
+verification. Root-confined tar extraction: no absolute paths, `..`
+components or symlink traversal; devices, fifos and sparse files rejected;
+setuid/setgid stripped; ownership and timestamps not applied; OCI whiteouts
+and opaque directories honored. Failed unpacks leave the partial tree for
+inspection and never reuse a rootfs. No registry access, signatures, Docker
+formats, zstd layers, image building, or worker input wiring.
 
 **Local execution and worker supervision** — `src/execution-plane/agent/module.cpp`,
 `src/execution-plane/worker/module.cpp`, `src/runtime/omnirun/module.cpp` and
@@ -63,14 +90,21 @@ and `src/control-plane/api/module.cpp`. Single-writer, versioned, checksummed,
 fsynced records with 64 KiB payload and 16 MiB file limits. Repairs incomplete
 final writes; complete corruption and invalid or unknown event payloads fail
 closed. Restores recorded reservations as Unknown with accounting retained;
-historic liveness events do not authorize execution. This is a manually invoked
-library interface, not a transactional integration into live controller mutations.
-Neither CLI uses it.
+historic liveness events do not authorize execution. `plan` and the local node
+agent record node, quota, workload, reservation, cancellation and observation
+facts before the mutation or external operation each fact describes, fail
+closed on recording errors, and report the acknowledged record count;
+`omnimesh recover` replays a journal into fresh memory and refuses to schedule
+against failed recoveries. Reservations committed inside `reconcile` are
+recorded after the commit but before any start intent or runtime use, so
+recovery restores only recorded facts. There are still no transactional
+in-lock mutations, compaction, leases, fencing, failover or distributed
+coordination.
 
 ## Not implemented
 
-OCI image loading, registry access, digest verification and conformance;
-artifact and spool storage; networking and message passing; discovery, enrollment and membership; authentication, authorization at
+Registry access, tag resolution, signature verification, Docker image formats,
+zstd layers and image building; networking and message passing; discovery, enrollment and membership; authentication, authorization at
 the API boundary and credential rotation; transactionally journaled desired-state
 mutations and distributed coordination storage; controller failover, leader election, leases and fencing tokens;
 telemetry, metrics, logs and audit sinks; the OMNI score and heuristic ranking;
@@ -82,8 +116,9 @@ Frantz.
 ## Known limitations
 
 - `Allocator` and `WorkloadController` are process-local and hold state in
-  memory. Manually journaled facts can be reconstructed, but the journal does
-  not wrap their live mutations. Local execution serializes sessions for one
+  memory. The CLIs record journaled facts before acting on them, but the journal
+  does not wrap their live mutations transactionally inside their locks. Local
+  execution serializes sessions for one
   host UID. Multiple users, isolated `/tmp` mounts and distributed controllers
   do not share authoritative accounting safely.
 - Caller identities passed to the controller and the `tenant` arguments are
@@ -104,8 +139,9 @@ Frantz.
   runtime. Unsupported limits are not removed from the generated bundle.
 - Local rootfs contents and their relationship to the requested image digest are
   administrator-verified. The agent records an annotation, not digest proof.
-- The journal has no compaction, distributed lease, fencing, automated recovery
-  or CLI integration. Failed recovery state must not be used for scheduling.
+- The journal has no compaction, distributed lease, fencing or automated
+  recovery. Failed recovery state must not be used for scheduling; `recover`
+  discards it with the local objects and reports the failure.
 - `Workload` updates are rejected with `conflict` rather than reconciled.
 - There is no conformance claim against any OCI specification version.
 - The plugin headers in `include/OmniMesh-Plugin.h` and
