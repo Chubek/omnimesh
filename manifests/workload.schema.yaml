@@ -1,19 +1,114 @@
 $schema: https://json-schema.org/draft/2020-12/schema
 $id: https://omnimesh.io/schemas/workload/v1alpha1
+title: OmniMesh Workload
+description: >-
+  Distributed execution settings belong to this OmniMesh specification. Standard
+  OCI fields must not be redefined here. This document is the authoritative
+  contract implemented by src/control-plane/admission/module.cpp for the
+  v1alpha1 milestone; general YAML syntax is rejected, only strict JSON (which
+  is also valid YAML 1.2) is accepted.
 type: object
 additionalProperties: false
 required: [apiVersion, kind, metadata, spec]
 properties:
-  apiVersion: {const: omnimesh.io/v1alpha1}
-  kind: {const: Workload}
-  metadata: {type: object, required: [name], properties: {name: {type: string}, tenant: {type: string}}}
+  apiVersion:
+    const: omnimesh.io/v1alpha1
+  kind:
+    const: Workload
+  metadata:
+    type: object
+    additionalProperties: false
+    required: [name]
+    properties:
+      name:
+        type: string
+        pattern: '^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$'
+        description: Tenant-scoped workload identity. Not unique within a tenant by itself.
+      tenant:
+        type: string
+        pattern: '^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$'
+        default: local
+        description: Administrative boundary for identity, quotas and isolation. Caller identity must match.
+      generation:
+        type: integer
+        minimum: 1
+        default: 1
+        description: Monotonically increasing version of this desired state.
   spec:
     type: object
     additionalProperties: false
     required: [image, command]
     properties:
-      image: {type: string, description: Immutable OCI digest required for production}
-      command: {type: array, items: {type: string}}
-      replicas: {type: integer, minimum: 1, default: 1}
-      privileged: {const: false}
-      capabilities: {type: array, items: {type: string}}
+      image:
+        type: string
+        pattern: '^([a-z0-9][a-z0-9._/:-]{0,252}[a-z0-9])?@?sha256:[0-9a-f]{64}$'
+        maxLength: 1024
+        description: >-
+          Immutable OCI digest. A mutable tag is rejected; record the resolved
+          digest before an attempt starts.
+      command:
+        type: array
+        minItems: 1
+        maxItems: 256
+        items:
+          type: string
+          maxLength: 4096
+        description: >-
+          argv vector. The first entry must be nonempty; every entry must be free
+          of embedded NUL. No shell expansion is performed.
+      replicas:
+        type: integer
+        minimum: 1
+        maximum: 256
+        default: 1
+      privileged:
+        const: false
+        description: Privileged execution is unsupported and rejected.
+      capabilities:
+        type: array
+        maxItems: 64
+        uniqueItems: true
+        items: {type: string, minLength: 1, maxLength: 128}
+        description: Hard node capability requirements, not preferences.
+      resources:
+        type: object
+        additionalProperties: false
+        required: [cpuMillis, memoryBytes]
+        properties:
+          cpuMillis: {type: integer, minimum: 1, maximum: 18446744073709551615}
+          memoryBytes: {type: integer, minimum: 1, maximum: 18446744073709551615}
+      platform:
+        type: object
+        additionalProperties: false
+        properties:
+          os:
+            const: linux
+            default: linux
+          architecture:
+            enum: [amd64, arm64]
+            description: Omit to accept any advertised node architecture.
+      runtime:
+        const: oci
+        default: oci
+      nodeSelector:
+        type: object
+        maxProperties: 64
+        propertyNames: {type: string, minLength: 1, maxLength: 128}
+        additionalProperties: {type: string, maxLength: 256}
+        description: Exact label matches required for placement.
+      retry:
+        type: object
+        additionalProperties: false
+        properties:
+          maxAttempts:
+            type: integer
+            minimum: 1
+            maximum: 16
+            default: 1
+            description: Attempt budget per replica. Each retry creates a new attempt record.
+          backoffMillis:
+            type: integer
+            minimum: 1
+            maximum: 60000
+            default: 1000
+            description: Base delay; doubles per attempt, capped at 60000 ms with stable per-attempt jitter.

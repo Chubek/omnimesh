@@ -6,8 +6,14 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 option(OMNIMESH_BUILD_TESTS "Build tests" ON)
 option(OMNIMESH_BUILD_DOCS "Build documentation when Doxygen is available" OFF)
 
+find_package(Threads REQUIRED)
+add_library(omnimesh-json INTERFACE)
+target_include_directories(omnimesh-json SYSTEM INTERFACE
+  ${CMAKE_CURRENT_SOURCE_DIR}/third_party/nlohmann-json/include)
+
 add_library(omnimesh-core STATIC
   src/common/status.cpp
+  src/common/model.cpp
   src/common/module.cpp
   src/control-plane/admission/module.cpp
   src/control-plane/allocator/module.cpp
@@ -36,19 +42,23 @@ add_library(omnimesh-core STATIC
   src/extensions/lua/module.cpp
   src/extensions/native/module.cpp
 )
-target_include_directories(omnimesh-core PUBLIC ${CMAKE_SOURCE_DIR}/include)
+target_include_directories(omnimesh-core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_link_libraries(omnimesh-core PUBLIC Threads::Threads PRIVATE omnimesh-json)
 target_compile_options(omnimesh-core PRIVATE -Wall -Wextra -Wpedantic)
 
 add_executable(omnimesh tools/main.cpp)
-target_link_libraries(omnimesh PRIVATE omnimesh-core)
+target_link_libraries(omnimesh PRIVATE omnimesh-core omnimesh-json)
+target_compile_options(omnimesh PRIVATE -Wall -Wextra -Wpedantic)
 add_executable(omnimesh-node-agent tools/node_agent.cpp)
-target_link_libraries(omnimesh-node-agent PRIVATE omnimesh-core)
+target_link_libraries(omnimesh-node-agent PRIVATE omnimesh-core omnimesh-json)
+target_compile_options(omnimesh-node-agent PRIVATE -Wall -Wextra -Wpedantic)
 
 if(OMNIMESH_BUILD_TESTS)
   enable_testing()
   add_executable(omnimesh-smoke tests/unit/smoke.cpp)
   target_link_libraries(omnimesh-smoke PRIVATE omnimesh-core)
   add_test(NAME smoke COMMAND omnimesh-smoke)
+  add_subdirectory(tests)
 endif()
 if(OMNIMESH_BUILD_DOCS)
   find_package(Doxygen QUIET)

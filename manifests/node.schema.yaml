@@ -1,10 +1,77 @@
 $schema: https://json-schema.org/draft/2020-12/schema
 $id: https://omnimesh.io/schemas/node/v1alpha1
-title: Node schema
+title: OmniMesh Node inventory document
+description: >-
+  A planning inventory entry supplied by an administrator. Discovery alone must
+  never grant membership: this document is not authenticated membership and
+  admission of a workload requires authorized, verified inventory. Nodes whose
+  advertised capabilities are unverified are rejected at placement time.
+  Implemented by src/control-plane/admission/module.cpp.
 type: object
 additionalProperties: false
-required: [apiVersion, kind]
+required: [apiVersion, kind, metadata, spec]
 properties:
-  apiVersion: {const: omnimesh.io/v1alpha1}
-  kind: {const: Node}
-  spec: {type: object, additionalProperties: false, description: Unsupported capabilities must be rejected.}
+  apiVersion:
+    const: omnimesh.io/v1alpha1
+  kind:
+    const: Node
+  metadata:
+    type: object
+    additionalProperties: false
+    required: [name]
+    properties:
+      name:
+        type: string
+        pattern: '^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$'
+        description: Node identity. Duplicate identities are rejected by the allocator.
+  spec:
+    type: object
+    additionalProperties: false
+    required: [resources, platform, runtimes, tenants, verified]
+    properties:
+      resources:
+        type: object
+        additionalProperties: false
+        required: [cpuMillis, memoryBytes]
+        description: Total capacity, not the unreserved remainder.
+        properties:
+          cpuMillis: {type: integer, minimum: 1, maximum: 18446744073709551615}
+          memoryBytes: {type: integer, minimum: 1, maximum: 18446744073709551615}
+      platform:
+        type: object
+        additionalProperties: false
+        required: [os, architecture]
+        properties:
+          os: {const: linux}
+          architecture: {enum: [amd64, arm64]}
+      runtimes:
+        type: array
+        minItems: 1
+        maxItems: 64
+        uniqueItems: true
+        items: {const: oci}
+      tenants:
+        type: array
+        minItems: 1
+        maxItems: 64
+        uniqueItems: true
+        items: {type: string, pattern: '^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$'}
+        description: Tenants authorized to place allocations here. Empty means nobody.
+      labels:
+        type: object
+        maxProperties: 64
+        propertyNames: {type: string, minLength: 1, maxLength: 128}
+        additionalProperties: {type: string, maxLength: 256}
+      capabilities:
+        type: array
+        maxItems: 64
+        uniqueItems: true
+        items: {type: string, minLength: 1, maxLength: 128}
+        description: Verified capabilities usable to satisfy workload requirements.
+      ready:
+        type: boolean
+        default: true
+        description: False marks the node as drained; it is skipped by placement.
+      verified:
+        type: boolean
+        description: Whether advertised capacities and capabilities were independently verified. Required.

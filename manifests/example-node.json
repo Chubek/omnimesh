@@ -1,0 +1,15 @@
+{
+  "apiVersion": "omnimesh.io/v1alpha1",
+  "kind": "Node",
+  "metadata": {"name": "node-a"},
+  "spec": {
+    "resources": {"cpuMillis": 4000, "memoryBytes": 1073741824},
+    "platform": {"os": "linux", "architecture": "amd64"},
+    "runtimes": ["oci"],
+    "tenants": ["local"],
+    "labels": {"site": "local"},
+    "capabilities": [],
+    "ready": true,
+    "verified": true
+  }
+}

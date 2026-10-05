@@ -1,1 +1,7 @@
-# Reserved for future integration tests.
+add_test(NAME cli COMMAND ${CMAKE_COMMAND}
+  -DCLI=$<TARGET_FILE:omnimesh>
+  -DNODE_AGENT=$<TARGET_FILE:omnimesh-node-agent>
+  -DSOURCE_DIR=${PROJECT_SOURCE_DIR}
+  -DTEST_DIR=${CMAKE_CURRENT_BINARY_DIR}/fixtures
+  -P ${CMAKE_CURRENT_SOURCE_DIR}/cli.cmake)
+set_tests_properties(cli PROPERTIES TIMEOUT 30)

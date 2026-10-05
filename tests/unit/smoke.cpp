@@ -1,3 +1,11 @@
 #include "omnimesh/status.hpp"
-#include <cassert>
-int main(){ assert(omnimesh::Status::NotImplemented("x").code==omnimesh::StatusCode::not_implemented); assert(omnimesh::version()[0]=='0'); return 0; }
+
+#include <string_view>
+
+int main() {
+  return omnimesh::Status::NotImplemented("x").code == omnimesh::StatusCode::not_implemented &&
+                 std::string_view(omnimesh::version()) == "0.1.0-alpha.1" &&
+                 std::string_view(omnimesh::status_code_name(omnimesh::StatusCode::conflict)) == "conflict"
+             ? 0
+             : 1;
+}
