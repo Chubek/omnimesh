@@ -7,6 +7,7 @@
 #include <limits>
 #include <nlohmann/json.hpp>
 #include <sys/utsname.h>
+#include <sys/stat.h>
 #include <thread>
 #include <unistd.h>
 using namespace omnimesh;
@@ -37,6 +38,12 @@ struct Fixture {
   }
   ~Fixture() {
     recover_fixture();
+    for (const auto &entry : std::filesystem::directory_iterator(root)) {
+      const auto inputs = entry.path() / "inputs";
+      if (std::filesystem::is_directory(inputs)) {
+        std::filesystem::permissions(inputs, std::filesystem::perms::owner_all);
+      }
+    }
     std::filesystem::remove_all(root);
   }
   LocalExecutionOptions options(const std::string &runtime,
@@ -88,6 +95,46 @@ void bundle_validation() {
   CHECK(prepare_bundle(workload, wrong, fixture.root + "/rootfs",
                        fixture.root + "/wrong")
             .code == StatusCode::permission_denied);
+  workload.inputs = {{"dataset", "sha256:" + Sha256::hexdigest("abc")}};
+  CHECK(prepare_bundle(workload, allocation, fixture.root + "/rootfs",
+                       fixture.root + "/missing-inputs").code == StatusCode::invalid_argument);
+  const auto inputs = fixture.root + "/protected/inputs";
+  CHECK(std::filesystem::create_directories(inputs));
+  std::ofstream(inputs + "/dataset") << "abc";
+  CHECK(chmod((inputs + "/dataset").c_str(), 0400) == 0);
+  CHECK(prepare_bundle(workload, allocation, fixture.root + "/rootfs",
+                       fixture.root + "/writable-inputs", inputs).code == StatusCode::invalid_argument);
+  CHECK(chmod(inputs.c_str(), 0500) == 0);
+  CHECK(prepare_bundle(workload, allocation, fixture.root + "/rootfs",
+                       fixture.root + "/input-bundle", inputs).ok());
+  std::ifstream input_config(fixture.root + "/input-bundle/config.json");
+  input_config >> config;
+  CHECK(config["mounts"][2]["destination"] == "/tmp");
+  CHECK(config["mounts"][3]["destination"] == "/tmp/omnimesh-inputs");
+  CHECK(config["mounts"][3]["source"] == inputs);
+  CHECK(config["mounts"][3]["options"] ==
+        Json::array({"bind", "ro", "nosuid", "nodev", "noexec"}));
+  CHECK(chmod(inputs.c_str(), 0700) == 0);
+  std::ofstream(inputs + "/extra") << "unexpected";
+  CHECK(chmod(inputs.c_str(), 0500) == 0);
+  CHECK(prepare_bundle(workload, allocation, fixture.root + "/rootfs",
+                       fixture.root + "/extra-input", inputs).code == StatusCode::invalid_argument);
+  CHECK(chmod(inputs.c_str(), 0700) == 0);
+  CHECK(std::filesystem::remove(inputs + "/extra"));
+  CHECK(std::filesystem::remove(inputs + "/dataset"));
+  std::filesystem::create_symlink(fixture.root + "/rootfs", inputs + "/dataset");
+  CHECK(chmod(inputs.c_str(), 0500) == 0);
+  CHECK(prepare_bundle(workload, allocation, fixture.root + "/rootfs",
+                       fixture.root + "/symlink-input", inputs).code == StatusCode::invalid_argument);
+  CHECK(chmod(inputs.c_str(), 0700) == 0);
+  CHECK(std::filesystem::remove(inputs + "/dataset"));
+  std::ofstream(fixture.root + "/original") << "abc";
+  CHECK(chmod((fixture.root + "/original").c_str(), 0400) == 0);
+  std::filesystem::create_hard_link(fixture.root + "/original", inputs + "/dataset");
+  CHECK(chmod(inputs.c_str(), 0500) == 0);
+  CHECK(prepare_bundle(workload, allocation, fixture.root + "/rootfs",
+                       fixture.root + "/hardlink-input", inputs).code == StatusCode::invalid_argument);
+  workload.inputs.clear();
   workload.resources.memory_bytes = std::numeric_limits<std::uint64_t>::max();
   allocation.request.requirements.resources = workload.resources;
   CHECK(prepare_bundle(workload, allocation, fixture.root + "/rootfs",
@@ -134,6 +181,149 @@ void execution(const std::string &runtime) {
   CHECK(retried.workload.tasks[0].attempts[0].state == AttemptState::failed);
   CHECK(retried.workload.tasks[0].attempts[1].state == AttemptState::succeeded);
 }
+void input_execution(const std::string &runtime) {
+  Fixture fixture;
+  const auto spool_path = fixture.root + "/spool";
+  ArtifactSpool spool;
+  CHECK(spool.open({spool_path}).ok());
+  ArtifactInfo info;
+  const std::string payload = "verified workload input";
+  CHECK(spool.put_bytes(payload, "local", info).ok());
+  CHECK(spool.close().ok());
+  auto workload = spec("inputs");
+  workload.inputs = {{"dataset", info.digest}};
+  workload.replicas = 2;
+  auto options = fixture.options(runtime, "inputs-session");
+  options.spool_directory = spool_path;
+  options.max_input_bytes = payload.size();
+  options.journal_directory = fixture.root + "/inputs-journal";
+  const auto result = execute_local(workload, node(), options);
+  CHECK(result.status.ok());
+  CHECK(result.inputs_verified);
+  CHECK(result.inputs.size() == 1);
+  CHECK(result.inputs[0].digest == info.digest);
+  CHECK(result.inputs[0].size == payload.size());
+  CHECK(result.input_directory == options.state_directory + "/inputs");
+  CHECK(result.workers.size() == 2);
+  CHECK(!result.reservations_retained);
+  struct stat mode{};
+  CHECK(stat(result.input_directory.c_str(), &mode) == 0);
+  CHECK((mode.st_mode & 0777) == 0500);
+  CHECK(stat((result.input_directory + "/dataset").c_str(), &mode) == 0);
+  CHECK((mode.st_mode & 0777) == 0400);
+  for (const auto &worker : result.workers) {
+    CHECK(worker.process.output.find(payload) != std::string::npos);
+  }
+  DurableControlPlane durable;
+  CHECK(durable.open(options.journal_directory).ok());
+  Allocator allocator;
+  WorkloadController controller(allocator);
+  CHECK(durable.recover(allocator, controller).status);
+  WorkloadRecord recovered;
+  CHECK(controller.inspect("local/hello", "local", recovered).ok());
+  CHECK(recovered.spec.inputs == workload.inputs);
+  CHECK(durable.close().ok());
+  workload.replicas = 1;
+  workload.command = {"/fixture/input-retry"};
+  workload.retry = {2, 1};
+  options.state_directory = fixture.root + "/inputs-retry";
+  options.journal_directory.clear();
+  const auto retried = execute_local(workload, node(), options);
+  CHECK(retried.status.ok());
+  CHECK(retried.workers.size() == 2);
+  for (const auto &worker : retried.workers) {
+    CHECK(worker.process.output.find(payload) != std::string::npos);
+  }
+  ArtifactSpool collector;
+  CHECK(collector.open({spool_path}).ok());
+  CollectReport collected;
+  CHECK(collector.collect({}, collected).ok());
+  CHECK(collected.removed == 1);
+  CHECK(collector.close().ok());
+  std::ifstream staged(result.input_directory + "/dataset");
+  std::string staged_payload((std::istreambuf_iterator<char>(staged)), {});
+  CHECK(staged_payload == payload);
+}
+
+void input_failures(const std::string &runtime) {
+  Fixture fixture;
+  const auto spool_path = fixture.root + "/spool";
+  ArtifactSpool spool;
+  CHECK(spool.open({spool_path}).ok());
+  ArtifactInfo info, foreign;
+  CHECK(spool.put_bytes(std::string(200000, 'x'), "local", info).ok());
+  CHECK(spool.put_bytes("foreign", "another", foreign).ok());
+  CHECK(spool.close().ok());
+  auto workload = spec("inputs");
+  workload.inputs = {{"dataset", info.digest}};
+  auto options = fixture.options(runtime, "missing-options");
+  CHECK(execute_local(workload, node(), options).status.code == StatusCode::invalid_argument);
+  CHECK(!std::filesystem::exists(options.state_directory));
+  options.spool_directory = spool_path;
+  auto assert_failure = [&](const std::string &name, StatusCode expected,
+                            const std::function<bool()> &cancelled = std::function<bool()>{}) {
+    options.state_directory = fixture.root + "/" + name;
+    const auto rejected = execute_local(workload, node(), options, cancelled);
+    CHECK(rejected.status.code == expected);
+    CHECK(!rejected.inputs_verified);
+    CHECK(!rejected.reservations_retained);
+    CHECK(rejected.workers.empty());
+    CHECK(!std::filesystem::exists(options.state_directory + "/bundle-1"));
+    CHECK(rejected.workload.tasks[0].state == TaskState::cancelled);
+    CHECK(rejected.workload.tasks[0].attempts.empty());
+  };
+  workload.inputs[0].digest = foreign.digest;
+  assert_failure("foreign", StatusCode::permission_denied);
+  workload.inputs[0].digest = "sha256:" + std::string(64, '0');
+  options.journal_directory = fixture.root + "/failure-journal";
+  assert_failure("missing", StatusCode::not_found);
+  DurableControlPlane durable;
+  CHECK(durable.open(options.journal_directory).ok());
+  Allocator allocator;
+  WorkloadController controller(allocator);
+  const auto report = durable.recover(allocator, controller);
+  CHECK(report.status);
+  CHECK(report.reservations_recovered == 0);
+  WorkloadRecord record;
+  CHECK(controller.inspect("local/hello", "local", record).ok());
+  CHECK(record.spec.inputs == workload.inputs);
+  CHECK(record.tasks[0].state == TaskState::cancelled);
+  CHECK(durable.close().ok());
+  options.journal_directory.clear();
+  workload.inputs[0].digest = info.digest;
+  options.max_input_bytes = 199999;
+  assert_failure("quota", StatusCode::resource_exhausted);
+  options.max_input_bytes = 200000;
+  workload.inputs.push_back({"alias", info.digest});
+  assert_failure("aggregate-quota", StatusCode::resource_exhausted);
+  workload.inputs.pop_back();
+  int checks = 0;
+  assert_failure("cancelled", StatusCode::unavailable, [&] {
+    return std::filesystem::exists(options.state_directory + "/inputs/dataset.omnimesh-part") &&
+           ++checks >= 3;
+  });
+  CHECK(checks == 3);
+  CHECK(!std::filesystem::exists(options.state_directory + "/inputs/dataset"));
+  CHECK(!std::filesystem::exists(options.state_directory + "/inputs/dataset.omnimesh-part"));
+  const auto blob = spool_path + "/blobs/" + info.digest.substr(7);
+  CHECK(chmod(blob.c_str(), 0600) == 0);
+  std::ofstream(blob, std::ios::binary) << std::string(200000, 'y');
+  CHECK(chmod(blob.c_str(), 0400) == 0);
+  assert_failure("corrupt", StatusCode::invalid_argument);
+  CHECK(std::filesystem::exists(blob));
+  options.state_directory = spool_path + "/inside";
+  CHECK(execute_local(workload, node(), options).status.code == StatusCode::invalid_argument);
+  CHECK(!std::filesystem::exists(options.state_directory));
+  options.state_directory = fixture.root + "/bad-bound";
+  options.max_input_bytes = 0;
+  CHECK(execute_local(workload, node(), options).status.code == StatusCode::invalid_argument);
+  options.max_input_bytes = kDefaultSpoolCapacityBytes + 1;
+  CHECK(execute_local(workload, node(), options).status.code == StatusCode::invalid_argument);
+  options.max_input_bytes = kDefaultSpoolCapacityBytes;
+  workload.inputs.clear();
+  CHECK(execute_local(workload, node(), options).status.code == StatusCode::invalid_argument);
+}
+
 void journaled_execution(const std::string &runtime) {
   Fixture fixture;
   auto workload = spec("args");
@@ -453,6 +643,8 @@ int main(int argc, char **argv) {
   return test::run([&] {
     bundle_validation();
     execution(argv[1]);
+    input_execution(argv[1]);
+    input_failures(argv[1]);
     journaled_execution(argv[1]);
     image_execution(argv[1]);
     failures(argv[1]);

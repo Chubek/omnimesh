@@ -102,8 +102,9 @@ and membership, API authentication, transactional persistent controllers,
 controller failover, telemetry, extensions, and Omnibuild/OmniVMM/Omnix/Initsys/
 Meshbox remain unimplemented. The Omnirun boundary now contains a local OCI
 runtime adapter, the execution plane contains a content-addressed artifact
-spool with no worker input wiring, and supporting services contain a local
+spool with verified workload inputs mounted read-only into local workers,
+and supporting services contain a local
 image-layout loader with no registry behind it. `docs/status.md`,
 `docs/third-regiment.md`, `docs/fourth-regiment.md` and
-`docs/fifth-regiment.md` and `docs/sixth-regiment.md` document tested behavior, compatibility limitations
-and manual recovery.
+`docs/fifth-regiment.md`, `docs/sixth-regiment.md` and `docs/seventh-regiment.md`
+document tested behavior, compatibility limitations and manual recovery.

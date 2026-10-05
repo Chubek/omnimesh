@@ -1,6 +1,7 @@
 #include "omnimesh/artifacts.hpp"
 #include "omnimesh/sha256.hpp"
 
+#include <algorithm>
 #include <cerrno>
 #include <cstdio>
 #include <cstring>
@@ -72,14 +73,24 @@ bool valid_artifact_digest(const std::string &digest) noexcept {
          is_hex64(digest.substr(7));
 }
 
+ArtifactSpool::~ArtifactSpool() {
+  if (lock_fd_ >= 0) {
+    ::close(lock_fd_);
+  }
+}
+
 std::string ArtifactSpool::blob_path(const std::string &hex) const {
   return options_.directory + "/blobs/" + hex;
 }
 
-Status ArtifactSpool::open(const SpoolOptions &options) {
+Status ArtifactSpool::open(const SpoolOptions &options,
+                           const std::function<bool()> &cancelled) {
   std::lock_guard<std::mutex> lock(mutex_);
   if (open_) {
     return {StatusCode::conflict, "spool is already open"};
+  }
+  if (cancelled && cancelled()) {
+    return {StatusCode::unavailable, "spool preparation cancelled"};
   }
   // Validate options with directory and capacity bounds before locking.
   if (options.directory.empty() || options.directory.size() > 4096 ||
@@ -131,6 +142,11 @@ Status ArtifactSpool::open(const SpoolOptions &options) {
     return io_error("cannot inspect spool staging area");
   }
   while (dirent *entry = readdir(staging)) {
+    if (cancelled && cancelled()) {
+      closedir(staging);
+      ::close(fd);
+      return {StatusCode::unavailable, "spool preparation cancelled"};
+    }
     const std::string name = entry->d_name;
     if (name == "." || name == "..") {
       continue;
@@ -153,7 +169,7 @@ Status ArtifactSpool::open(const SpoolOptions &options) {
   open_ = true;
   index_.clear();
   diagnostics_.clear();
-  Status status = reconcile();
+  Status status = reconcile(cancelled);
   if (!status.ok()) {
     ::close(lock_fd_);
     lock_fd_ = -1;
@@ -233,13 +249,17 @@ Status ArtifactSpool::save_index() {
   return status;
 }
 
-Status ArtifactSpool::reconcile() {
+Status ArtifactSpool::reconcile(const std::function<bool()> &cancelled) {
   std::map<std::string, ArtifactInfo> disk;
   DIR *store = opendir((options_.directory + "/blobs").c_str());
   if (!store) {
     return io_error("cannot inspect spool store");
   }
   while (dirent *entry = readdir(store)) {
+    if (cancelled && cancelled()) {
+      closedir(store);
+      return {StatusCode::unavailable, "spool preparation cancelled"};
+    }
     const std::string name = entry->d_name;
     if (name == "." || name == "..") {
       continue;
@@ -282,6 +302,10 @@ Status ArtifactSpool::reconcile() {
       char chunk[kChunkBytes];
       bool read_error = false;
       while (true) {
+        if (cancelled && cancelled()) {
+          ::close(fd);
+          return {StatusCode::unavailable, "spool preparation cancelled"};
+        }
         const ssize_t count = read(fd, chunk, sizeof(chunk));
         if (count < 0) {
           read_error = true;
@@ -310,6 +334,9 @@ Status ArtifactSpool::reconcile() {
   }
   if (index_usable) {
     for (const auto &item : saved["blobs"].items()) {
+      if (cancelled && cancelled()) {
+        return {StatusCode::unavailable, "spool preparation cancelled"};
+      }
       const std::string digest = "sha256:" + item.key();
       const auto blob = disk.find(digest);
       if (blob == disk.end()) {
@@ -335,6 +362,9 @@ Status ArtifactSpool::reconcile() {
         {"$spool", "spool index was unreadable and will be rebuilt"});
   }
   for (const auto &entry : disk) {
+    if (cancelled && cancelled()) {
+      return {StatusCode::unavailable, "spool preparation cancelled"};
+    }
     if (rebuilt.count(entry.first) != 0) {
       continue;
     }
@@ -350,6 +380,10 @@ Status ArtifactSpool::reconcile() {
     std::uint64_t hashed = 0;
     bool read_error = false;
     while (true) {
+      if (cancelled && cancelled()) {
+        ::close(fd);
+        return {StatusCode::unavailable, "spool preparation cancelled"};
+      }
       const ssize_t count = read(fd, chunk, sizeof(chunk));
       if (count < 0) {
         read_error = true;
@@ -379,6 +413,9 @@ Status ArtifactSpool::reconcile() {
     }
   }
   index_ = std::move(rebuilt);
+  if (cancelled && cancelled()) {
+    return {StatusCode::unavailable, "spool preparation cancelled"};
+  }
   return save_index();
 }
 
@@ -600,11 +637,12 @@ Status ArtifactSpool::put(const std::string &path, const std::string &tenant,
 
 Status ArtifactSpool::fetch(const std::string &digest,
                             const std::string &tenant,
-                            const std::string &out_path) {
+                            const std::string &out_path,
+                            const FetchOptions &options) {
+  std::lock_guard<std::mutex> fetch_lock(mutex_);
   std::string source;
   std::uint64_t size = 0;
   {
-    std::lock_guard<std::mutex> lock(mutex_);
     if (!open_) {
       return {StatusCode::unavailable, "spool is not open"};
     }
@@ -626,10 +664,22 @@ Status ArtifactSpool::fetch(const std::string &digest,
       out_path.find('\0') != std::string::npos) {
     return {StatusCode::invalid_argument, "invalid artifact output path"};
   }
-  const int blob = ::open(source.c_str(), O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+  if (size > std::min(options.max_bytes, kMaxArtifactBytes)) {
+    return {StatusCode::resource_exhausted, "artifact exceeds the fetch byte bound"};
+  }
+  if (options.cancelled && options.cancelled()) {
+    return {StatusCode::unavailable, "artifact fetch cancelled"};
+  }
+  const int blob = ::open(source.c_str(), O_RDONLY | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK);
   if (blob < 0) {
     return {StatusCode::unavailable,
             "stored blob is unreachable; spool may need recovery"};
+  }
+  struct stat blob_info{};
+  if (fstat(blob, &blob_info) != 0 || !S_ISREG(blob_info.st_mode) ||
+      blob_info.st_size < 0 || static_cast<std::uint64_t>(blob_info.st_size) != size) {
+    ::close(blob);
+    return {StatusCode::invalid_argument, "stored blob must be a regular file of indexed size"};
   }
   const auto staging = out_path + ".omnimesh-part";
   if (staging.size() > 4096 + 16) {
@@ -647,6 +697,10 @@ Status ArtifactSpool::fetch(const std::string &digest,
   std::uint64_t copied = 0;
   Status status = Status::Ok();
   while (true) {
+    if (options.cancelled && options.cancelled()) {
+      status = {StatusCode::unavailable, "artifact fetch cancelled"};
+      break;
+    }
     const ssize_t count = read(blob, chunk, sizeof(chunk));
     if (count < 0) {
       status = io_error("cannot read stored blob");
@@ -665,7 +719,7 @@ Status ArtifactSpool::fetch(const std::string &digest,
     std::size_t remaining = static_cast<std::size_t>(count);
     while (remaining > 0) {
       const ssize_t written = write(out, bytes, remaining);
-      if (written < 0) {
+      if (written <= 0) {
         status = io_error("cannot write artifact output");
         break;
       }
@@ -692,6 +746,10 @@ Status ArtifactSpool::fetch(const std::string &digest,
     unlink(staging.c_str());
     return {StatusCode::invalid_argument,
             "stored blob failed verification; spool preserved"};
+  }
+  if (options.cancelled && options.cancelled()) {
+    unlink(staging.c_str());
+    return {StatusCode::unavailable, "artifact fetch cancelled"};
   }
   if (rename(staging.c_str(), out_path.c_str()) != 0) {
     unlink(staging.c_str());

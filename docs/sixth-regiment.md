@@ -127,7 +127,9 @@ verifies the actual layers.
 The workload API remains `omnimesh.io/v1alpha1`; journal framing is unchanged.
 CLI output fields and C++ options/results are additive; rebuild C++ consumers
 against the updated static library. Image building, registries, signatures,
-cross-node transfer and workload artifact inputs remain unimplemented.
+cross-node transfer and workload artifact inputs remained unimplemented at
+this regiment. The [seventh regiment](seventh-regiment.md) subsequently adds
+local workload artifact inputs.
 
 ## Validation
 

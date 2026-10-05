@@ -68,9 +68,12 @@ int run(int argc, char **argv) {
                  "  --state-dir /fresh/private/session [--timeout-ms 60000] "
                  "[--grace-ms 1000]\n"
                  "  [--journal-dir /durable/journal] [--max-image-bytes 1073741824]\n"
+                 "  [--spool-dir /local/spool] [--max-input-bytes 268435456]\n"
                  "Foreground local OCI execution. Image layouts are verified "
                  "against the workload manifest digest and staged in the session. "
                  "--rootfs selects an administrator-provisioned tree. "
+                 "Declared inputs require --spool-dir and appear read-only at "
+                 "/tmp/omnimesh-inputs/<name>. "
                  "A journal directory enables "
                  "durable recording of control-plane facts before use; "
                  "recover it with `omnimesh recover`.\n";
@@ -87,7 +90,8 @@ int run(int argc, char **argv) {
         (key != "--node" && key != "--runtime" && key != "--rootfs" &&
          key != "--state-dir" && key != "--timeout-ms" &&
           key != "--grace-ms" && key != "--journal-dir" &&
-          key != "--image-layout" && key != "--max-image-bytes") ||
+          key != "--image-layout" && key != "--max-image-bytes" &&
+          key != "--spool-dir" && key != "--max-input-bytes") ||
         !arguments.emplace(key, argv[i + 1]).second) {
       return fail({StatusCode::invalid_argument,
                    "unknown, missing or duplicate execution option"});
@@ -107,6 +111,19 @@ int run(int argc, char **argv) {
                  "--max-image-bytes requires --image-layout"});
   }
   LocalExecutionOptions options;
+  if (arguments.count("--max-input-bytes") && !arguments.count("--spool-dir")) {
+    return fail({StatusCode::invalid_argument, "--max-input-bytes requires --spool-dir"});
+  }
+  if (arguments.count("--spool-dir")) {
+    options.spool_directory = arguments.at("--spool-dir");
+    if (options.spool_directory.empty()) {
+      return fail({StatusCode::invalid_argument, "spool directory must be nonempty"});
+    }
+  }
+  if (arguments.count("--max-input-bytes") &&
+      !integer(arguments.at("--max-input-bytes"), options.max_input_bytes)) {
+    return fail({StatusCode::invalid_argument, "input byte bound must be unsigned bytes"});
+  }
   options.runtime_executable = arguments.at("--runtime");
   if (arguments.count("--rootfs")) {
     options.rootfs = arguments.at("--rootfs");
@@ -180,7 +197,17 @@ int run(int argc, char **argv) {
                  {"files", result.image.files},
                  {"bytes", result.image.bytes}}},
               {"tasks", Json::array()},
+              {"inputs", {{"path", result.input_directory},
+                           {"verified", result.inputs_verified},
+                           {"files", Json::array()}}},
               {"workers", Json::array()}};
+  for (std::size_t index = 0; index < result.inputs.size(); ++index) {
+    const auto &input = result.inputs[index];
+    output["inputs"]["files"].push_back(
+        {{"name", workload.value.inputs[index].name}, {"digest", input.digest},
+         {"bytes", input.size},
+         {"destination", "/tmp/omnimesh-inputs/" + workload.value.inputs[index].name}});
+  }
   for (const auto &task : result.workload.tasks) {
     Json item{{"taskId", task.id},
               {"state", task_state_name(task.state)},

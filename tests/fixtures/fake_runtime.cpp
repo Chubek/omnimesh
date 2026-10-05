@@ -65,6 +65,28 @@ int main(int argc, char **argv) {
         std::cout << payload.rdbuf();
       }
       for (int i = 0; i < 30; ++i) {
+        if (i == 0 && (mode == "/fixture/inputs" || mode == "/fixture/input-retry")) {
+          bool found = false;
+          for (const auto &mount : config["mounts"]) {
+            if (mount["destination"] != "/tmp/omnimesh-inputs") {
+              continue;
+            }
+            if (mount["type"] != "bind" ||
+                mount["options"] != Json::array({"bind", "ro", "nosuid", "nodev", "noexec"})) {
+              return 1;
+            }
+            const std::string source = mount["source"];
+            std::ifstream payload(source + "/dataset", std::ios::binary);
+            if (!payload) {
+              return 1;
+            }
+            std::cout << payload.rdbuf();
+            found = true;
+          }
+          if (!found) {
+            return 1;
+          }
+        }
         if (stopped && mode != "/fixture/ignore-term" &&
             mode != "/fixture/unstoppable") {
           break;
@@ -82,7 +104,7 @@ int main(int argc, char **argv) {
         write(path, state);
       }
       if (mode == "/fixture/fail" ||
-          (mode == "/fixture/retry" && id == "omni-1")) {
+          ((mode == "/fixture/retry" || mode == "/fixture/input-retry") && id == "omni-1")) {
         return 7;
       }
       return 0;

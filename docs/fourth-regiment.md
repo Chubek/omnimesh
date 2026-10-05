@@ -55,10 +55,11 @@ intermediate digests never disturb further updates.
 
 ## Explicitly out of scope
 
-Workload manifests declare no artifact inputs: no schema, admission or agent
-wiring stages spool blobs into worker bundles. Fetching for workers,
-registry-backed image loading, digest verification of provisioned rootfs
-contents, and cross-node transfer remain later work. The spool does not back
+At the fourth regiment, workload manifests declared no artifact inputs.
+The [seventh regiment](seventh-regiment.md) adds schema, admission and local
+agent wiring for verified input snapshots. Registry-backed image loading,
+digest verification of administrator-provisioned rootfs contents, output
+collection and cross-node transfer remain later work. The spool does not back
 the control-plane journal.
 
 ## Validation

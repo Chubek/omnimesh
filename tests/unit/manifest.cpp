@@ -145,6 +145,48 @@ void nodes() {
   CHECK(!parse_node(value.dump()).status.ok());
 }
 
+void artifact_inputs() {
+  auto value = document();
+  const Json input{{"name", "dataset"}, {"digest", "sha256:" + std::string(64, 'b')}};
+  value["spec"]["inputs"] = Json::array({input});
+  const auto parsed = parse_workload(value.dump());
+  CHECK(parsed.status.ok());
+  CHECK(parsed.value.inputs.size() == 1);
+  CHECK(parse_workload(encode_workload(parsed.value)).value == parsed.value);
+  auto changed = parsed.value;
+  changed.inputs[0].digest = "sha256:" + std::string(64, 'c');
+  CHECK(!(changed == parsed.value));
+  value["spec"]["inputs"].push_back(input);
+  CHECK(has_path(parse_workload(value.dump()), "$.spec.inputs[1].name"));
+  for (const std::string name : {"../escape", "/absolute", "nested/file", "", "Upper", "."}) {
+    value["spec"]["inputs"] = Json::array({input});
+    value["spec"]["inputs"][0]["name"] = name;
+    CHECK(has_path(parse_workload(value.dump()), "$.spec.inputs[0].name"));
+  }
+  value["spec"]["inputs"] = Json::array({input});
+  value["spec"]["inputs"][0]["digest"] = "repo@sha256:" + std::string(64, 'b');
+  CHECK(has_path(parse_workload(value.dump()), "$.spec.inputs[0].digest"));
+  value["spec"]["inputs"] = Json::array({input});
+  value["spec"]["inputs"][0]["destination"] = "/etc";
+  CHECK(has_path(parse_workload(value.dump()), "$.spec.inputs[0].destination"));
+  value["spec"]["inputs"][0].erase("destination");
+  value["spec"]["inputs"][0].erase("digest");
+  CHECK(has_path(parse_workload(value.dump()), "$.spec.inputs[0].digest"));
+  for (const Json& invalid : {Json::object(), Json(nullptr), Json("input"), Json::array({7})}) {
+    value["spec"]["inputs"] = invalid;
+    CHECK(!parse_workload(value.dump()).status.ok());
+  }
+  value["spec"]["inputs"] = Json::array();
+  for (std::size_t index = 0; index < kMaxWorkloadInputs; ++index) {
+    auto entry = input;
+    entry["name"] = "input-" + std::to_string(index);
+    value["spec"]["inputs"].push_back(entry);
+  }
+  CHECK(parse_workload(value.dump()).status.ok());
+  value["spec"]["inputs"].push_back(input);
+  CHECK(has_path(parse_workload(value.dump()), "$.spec.inputs"));
+}
+
 } // namespace
 
 int main() {
@@ -153,5 +195,6 @@ int main() {
     admission_and_unknown_fields();
     bounded_strict_json();
     nodes();
+    artifact_inputs();
   });
 }

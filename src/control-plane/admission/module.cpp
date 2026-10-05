@@ -1,4 +1,5 @@
 #include "omnimesh/manifest.hpp"
+#include "omnimesh/artifacts.hpp"
 #include "omnimesh/allocator.hpp"
 
 #include <nlohmann/json.hpp>
@@ -356,6 +357,22 @@ std::vector<Diagnostic> validate_workload(const Workload& workload) {
     error(diagnostics, "$.spec.replicas", "expected an integer from 1 to 256");
   }
   check_requirements(diagnostics, requirements_for(workload));
+  if (workload.inputs.size() > kMaxWorkloadInputs) {
+    error(diagnostics, "$.spec.inputs", "expected at most 32 artifact inputs");
+  }
+  std::set<std::string> input_names;
+  for (std::size_t index = 0;
+       index < std::min(workload.inputs.size(), kMaxWorkloadInputs); ++index) {
+    const auto path = "$.spec.inputs[" + std::to_string(index) + "]";
+    const auto& input = workload.inputs[index];
+    check_identifier(diagnostics, path + ".name", input.name);
+    if (!input_names.insert(input.name).second) {
+      error(diagnostics, path + ".name", "input names must be unique");
+    }
+    if (!valid_artifact_digest(input.digest)) {
+      error(diagnostics, path + ".digest", "expected sha256:<64 lowercase hex digits>");
+    }
+  }
   if (workload.retry.max_attempts == 0 || workload.retry.max_attempts > 16) {
     error(diagnostics, "$.spec.retry.maxAttempts", "expected an integer from 1 to 16");
   }
@@ -407,6 +424,12 @@ std::string encode_workload(const Workload& workload) {
                 {"retry", {{"maxAttempts", workload.retry.max_attempts},
                            {"backoffMillis", workload.retry.backoff_millis}}}}}};
   if (workload.platform.architecture.empty()) { document["spec"]["platform"].erase("architecture"); }
+  if (!workload.inputs.empty()) {
+    document["spec"]["inputs"] = Json::array();
+    for (const auto& input : workload.inputs) {
+      document["spec"]["inputs"].push_back({{"name", input.name}, {"digest", input.digest}});
+    }
+  }
   return document.dump();
 }
 
@@ -452,7 +475,7 @@ ManifestResult<Workload> parse_workload(std::string_view document) {
   if (root.contains("spec") &&
       decoder.object(root["spec"], "$.spec",
                      {"image", "command", "replicas", "privileged", "capabilities",
-                      "resources", "platform", "runtime", "nodeSelector", "retry"},
+                      "resources", "platform", "runtime", "nodeSelector", "retry", "inputs"},
                      {"image", "command"})) {
     const auto& spec = root["spec"];
     if (spec.contains("image")) {
@@ -485,6 +508,26 @@ ManifestResult<Workload> parse_workload(std::string_view document) {
     }
     if (spec.contains("capabilities")) {
       decoder.strings(spec["capabilities"], "$.spec.capabilities", workload.capabilities);
+    }
+    if (spec.contains("inputs")) {
+      const auto& inputs = spec["inputs"];
+      if (!inputs.is_array() || inputs.size() > kMaxWorkloadInputs) {
+        error(decoder.diagnostics, "$.spec.inputs", "expected an array of at most 32 artifact inputs");
+      } else {
+        for (std::size_t index = 0; index < inputs.size(); ++index) {
+          const auto path = "$.spec.inputs[" + std::to_string(index) + "]";
+          ArtifactInput input;
+          if (decoder.object(inputs[index], path, {"name", "digest"}, {"name", "digest"})) {
+            if (inputs[index].contains("name")) {
+              decoder.string(inputs[index]["name"], path + ".name", input.name);
+            }
+            if (inputs[index].contains("digest")) {
+              decoder.string(inputs[index]["digest"], path + ".digest", input.digest);
+            }
+          }
+          workload.inputs.push_back(std::move(input));
+        }
+      }
     }
     if (spec.contains("retry") &&
         decoder.object(spec["retry"], "$.spec.retry", {"maxAttempts", "backoffMillis"})) {

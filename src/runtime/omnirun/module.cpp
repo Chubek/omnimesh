@@ -156,7 +156,8 @@ Status OciRuntime::remove(const std::string &id) const {
   return command({"delete", id}, result);
 }
 Status prepare_bundle(const Workload &workload, const Allocation &allocation,
-                      const std::string &rootfs, const std::string &bundle) {
+                      const std::string &rootfs, const std::string &bundle,
+                      const std::string &input_directory) {
   const auto diagnostics = validate_workload(workload);
   if (!diagnostics.empty()) {
     return {StatusCode::invalid_argument, diagnostics.front().message};
@@ -181,6 +182,48 @@ Status prepare_bundle(const Workload &workload, const Allocation &allocation,
   if (!workload.capabilities.empty()) {
     return {StatusCode::unavailable,
             "local execution has no device or optional capability adapters"};
+  }
+  std::filesystem::path inputs;
+  if (workload.inputs.empty() != input_directory.empty()) {
+    return {StatusCode::invalid_argument, "bundle inputs must match the workload declarations"};
+  }
+  if (!input_directory.empty()) {
+    struct stat info{};
+    if (!absolute_text(input_directory) ||
+        lstat(input_directory.c_str(), &info) != 0 || !S_ISDIR(info.st_mode) ||
+        (info.st_mode & 0777) != 0500 || info.st_uid != getuid()) {
+      return {StatusCode::invalid_argument, "bundle input directory must be a private protected snapshot"};
+    }
+    inputs = std::filesystem::canonical(input_directory, error);
+    if (error || inputs == "/") {
+      return {StatusCode::invalid_argument, "cannot resolve bundle input directory"};
+    }
+    std::set<std::string> names;
+    for (const auto &input : workload.inputs) {
+      names.insert(input.name);
+    }
+    std::filesystem::directory_iterator entries(inputs, error);
+    if (error) {
+      return {StatusCode::invalid_argument, "cannot inspect bundle input snapshot"};
+    }
+    const std::filesystem::directory_iterator end;
+    while (entries != end) {
+      const auto path = entries->path();
+      if (names.erase(path.filename().string()) != 1 ||
+          lstat(path.c_str(), &info) != 0 || !S_ISREG(info.st_mode) ||
+          (info.st_mode & 0777) != 0400 || info.st_uid != getuid() ||
+          info.st_nlink != 1 || info.st_size < 0 ||
+          static_cast<std::uint64_t>(info.st_size) > kMaxArtifactBytes) {
+        return {StatusCode::invalid_argument, "bundle input snapshot has unexpected or unsafe files"};
+      }
+      entries.increment(error);
+      if (error) {
+        return {StatusCode::invalid_argument, "cannot inspect bundle input snapshot"};
+      }
+    }
+    if (!names.empty()) {
+      return {StatusCode::invalid_argument, "bundle input snapshot is incomplete"};
+    }
   }
   if (workload.resources.memory_bytes >
           static_cast<std::uint64_t>(
@@ -259,6 +302,12 @@ Status prepare_bundle(const Workload &workload, const Allocation &allocation,
         {"io.omnimesh.attempt", request.attempt_id},
         {"io.omnimesh.allocation", allocation.id},
         {"io.omnimesh.generation", std::to_string(workload.generation)}}}};
+  if (!inputs.empty()) {
+    config["mounts"].push_back(
+        {{"destination", "/tmp/omnimesh-inputs"}, {"type", "bind"},
+         {"source", inputs.string()},
+         {"options", {"bind", "ro", "nosuid", "nodev", "noexec"}}});
+  }
   std::ofstream file(bundle + "/config.json", std::ios::binary);
   file << config.dump(2) << '\n';
   file.close();

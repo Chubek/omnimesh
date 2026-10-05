@@ -79,6 +79,64 @@ std::string host_architecture() {
   const std::string machine = info.machine;
   return machine == "x86_64" ? "amd64" : machine == "aarch64" ? "arm64" : "";
 }
+
+Status stage_inputs(const Workload &workload,
+                    const LocalExecutionOptions &options,
+                    LocalExecutionResult &result,
+                    const std::function<bool()> &cancelled) {
+  if (cancelled()) {
+    return {StatusCode::unavailable, "input preparation cancelled or exceeded its deadline"};
+  }
+  ArtifactSpool spool;
+  auto status = spool.open({options.spool_directory}, cancelled);
+  if (!status.ok()) {
+    return status;
+  }
+  result.input_directory = result.session_directory + "/inputs";
+  if (mkdir(result.input_directory.c_str(), 0700) != 0) {
+    return {StatusCode::internal, "cannot create private input staging directory"};
+  }
+  std::uint64_t total_bytes = 0;
+  for (const auto &input : workload.inputs) {
+    if (cancelled()) {
+      return {StatusCode::unavailable, "input preparation cancelled or exceeded its deadline"};
+    }
+    ArtifactInfo info;
+    status = spool.inspect(input.digest, info);
+    if (!status.ok()) {
+      return status;
+    }
+    if (info.tenant != workload.tenant) {
+      return {StatusCode::permission_denied, "input artifact belongs to another tenant"};
+    }
+    if (info.size > options.max_input_bytes - total_bytes) {
+      return {StatusCode::resource_exhausted, "workload inputs exceed the session byte bound"};
+    }
+    const auto path = result.input_directory + "/" + input.name;
+    status = spool.fetch(input.digest, workload.tenant, path,
+                         {options.max_input_bytes - total_bytes, cancelled});
+    if (!status.ok()) {
+      return status;
+    }
+    if (chmod(path.c_str(), 0400) != 0) {
+      return {StatusCode::internal, "cannot protect staged input file"};
+    }
+    total_bytes += info.size;
+    result.inputs.push_back(info);
+  }
+  if (chmod(result.input_directory.c_str(), 0500) != 0) {
+    return {StatusCode::internal, "cannot protect staged input directory"};
+  }
+  status = spool.close();
+  if (!status.ok()) {
+    return status;
+  }
+  if (cancelled()) {
+    return {StatusCode::unavailable, "input preparation cancelled or exceeded its deadline"};
+  }
+  result.inputs_verified = true;
+  return Status::Ok();
+}
 } // namespace
 LocalExecutionResult execute_local(const Workload &workload, const Node &node,
                                    const LocalExecutionOptions &options,
@@ -139,6 +197,14 @@ LocalExecutionResult execute_local(const Workload &workload, const Node &node,
                    "node architecture does not match this host"});
   }
   const bool from_image = !options.image_layout.empty();
+  const bool with_inputs = !workload.inputs.empty();
+  if (with_inputs != !options.spool_directory.empty() ||
+      options.max_input_bytes == 0 ||
+      options.max_input_bytes > kDefaultSpoolCapacityBytes) {
+    return finish({StatusCode::invalid_argument,
+                   "input workloads require a spool directory and a 1-268435456 byte bound; "
+                   "a spool directory requires declared inputs"});
+  }
   if (options.rootfs.empty() == options.image_layout.empty()) {
     return finish({StatusCode::invalid_argument,
                    "select exactly one of rootfs or image layout"});
@@ -240,7 +306,22 @@ LocalExecutionResult execute_local(const Workload &workload, const Node &node,
         {StatusCode::invalid_argument,
          "state directory must be outside the rootfs or image layout"});
   }
-  if (from_image) {
+  if (with_inputs) {
+    if (options.spool_directory.front() != '/' ||
+        options.spool_directory.size() > 4096 ||
+        options.spool_directory.find('\0') != std::string::npos) {
+      return finish({StatusCode::invalid_argument, "spool directory must be an absolute path"});
+    }
+    const auto spool_path = std::filesystem::canonical(options.spool_directory, error);
+    if (error || spool_path == "/" || !std::filesystem::is_directory(spool_path, error) ||
+        error || state_path == spool_path ||
+        state_path.string().compare(0, spool_path.string().size() + 1,
+                                    spool_path.string() + "/") == 0) {
+      return finish({StatusCode::invalid_argument,
+                     "spool must be an existing directory other than /, outside the session"});
+    }
+  }
+  if (from_image || with_inputs) {
     const auto placement =
         propose_placement(requirements_for(workload), allocator.snapshot());
     if (!placement.status.ok()) {
@@ -255,6 +336,21 @@ LocalExecutionResult execute_local(const Workload &workload, const Node &node,
                                "existing runtime state before recovery"});
   }
   result.session_directory = state_path.string();
+  bool preparation_cancelled = false;
+  const std::function<bool()> preparation_stopped = [&] {
+    preparation_cancelled = preparation_cancelled ||
+                            MonotonicClock::now() >= deadline ||
+                            (cancelled && cancelled());
+    return preparation_cancelled;
+  };
+  auto fail_preparation = [&](Status failure) {
+    const auto recorded = note_cancellation();
+    if (!recorded.ok()) {
+      return finish(recorded);
+    }
+    controller.cancel(workload_id, workload.tenant);
+    return finish(std::move(failure));
+  };
   auto rootfs = source_path;
   if (from_image) {
     rootfs = state_path / "rootfs";
@@ -267,28 +363,22 @@ LocalExecutionResult execute_local(const Workload &workload, const Node &node,
                                  ? workload.image
                                  : workload.image.substr(at + 1);
     unpack.max_bytes = options.max_image_bytes;
-    bool preparation_cancelled = false;
-    unpack.cancelled = [&] {
-      preparation_cancelled = preparation_cancelled ||
-                              MonotonicClock::now() >= deadline ||
-                              (cancelled && cancelled());
-      return preparation_cancelled;
-    };
+    unpack.cancelled = preparation_stopped;
     result.rootfs_directory = rootfs.string();
     ImageLoader loader;
     status = loader.unpack(unpack, result.image);
     if (!status.ok()) {
-      const auto failure = status;
-      status = note_cancellation();
-      if (!status.ok()) {
-        return finish(status);
-      }
-      controller.cancel(workload_id, workload.tenant);
-      return finish(failure);
+      return fail_preparation(status);
     }
     result.image_verified = true;
   }
   result.rootfs_directory = rootfs.string();
+  if (with_inputs) {
+    status = stage_inputs(workload, options, result, preparation_stopped);
+    if (!status.ok()) {
+      return fail_preparation(status);
+    }
+  }
   const auto runtime_root = result.session_directory + "/runtime";
   if (mkdir(runtime_root.c_str(), 0700) != 0) {
     return finish(
@@ -390,7 +480,8 @@ LocalExecutionResult execute_local(const Workload &workload, const Node &node,
     }
     const auto bundle =
         result.session_directory + "/bundle-" + std::to_string(ordinal);
-    status = prepare_bundle(workload, allocation, rootfs.string(), bundle);
+    status = prepare_bundle(workload, allocation, rootfs.string(), bundle,
+                            result.input_directory);
     if (!status.ok()) {
       const auto failure = status;
       status = note_cancellation();

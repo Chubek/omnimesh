@@ -280,6 +280,71 @@ void rejects_foreign_files() {
   CHECK(foreign.open(sandbox.options()).code == StatusCode::invalid_argument);
 }
 
+void bounded_cancellable_fetch() {
+  Sandbox sandbox;
+  ArtifactSpool spool;
+  CHECK(spool.open(sandbox.options()).ok());
+  ArtifactInfo info;
+  CHECK(spool.put_bytes(std::string(200000, 'x'), "local", info).ok());
+  const auto output = sandbox.root + "/output";
+  sandbox.write(output, "preserved");
+  CHECK(spool.fetch(info.digest, "local", output, {199999, {}}).code ==
+        StatusCode::resource_exhausted);
+  int checks = 0;
+  CHECK(spool.fetch(info.digest, "local", output,
+                    {200000, [&] { return ++checks == 4; }}).code ==
+        StatusCode::unavailable);
+  CHECK(checks == 4);
+  CHECK(!std::filesystem::exists(output + ".omnimesh-part"));
+  std::ifstream preserved(output);
+  std::string bytes;
+  preserved >> bytes;
+  CHECK(bytes == "preserved");
+  CHECK(spool.fetch(info.digest, "local", output, {200000, {}}).ok());
+  CHECK(std::filesystem::file_size(output) == 200000);
+  const auto blob = sandbox.spool() + "/blobs/" + info.digest.substr(7);
+  CHECK(std::filesystem::remove(blob));
+  CHECK(mkfifo(blob.c_str(), 0600) == 0);
+  CHECK(spool.fetch(info.digest, "local", output).code == StatusCode::invalid_argument);
+  CHECK(spool.close().ok());
+}
+
+void destructor_releases_lock() {
+  Sandbox sandbox;
+  {
+    ArtifactSpool spool;
+    CHECK(spool.open(sandbox.options()).ok());
+    ArtifactInfo info;
+    CHECK(spool.put_bytes("retained", "local", info).ok());
+  }
+  ArtifactSpool reopened;
+  CHECK(reopened.open(sandbox.options()).ok());
+  CHECK(reopened.list().size() == 1);
+  CHECK(reopened.close().ok());
+}
+
+void cancellable_recovery() {
+  Sandbox sandbox;
+  ArtifactInfo info;
+  {
+    ArtifactSpool spool;
+    CHECK(spool.open(sandbox.options()).ok());
+    CHECK(spool.put_bytes(std::string(200000, 'x'), "local", info).ok());
+    CHECK(spool.close().ok());
+  }
+  CHECK(std::filesystem::remove(sandbox.spool() + "/index.json"));
+  int checks = 0;
+  ArtifactSpool cancelled;
+  CHECK(cancelled.open(sandbox.options(), [&] { return ++checks >= 8; }).code ==
+        StatusCode::unavailable);
+  CHECK(!std::filesystem::exists(sandbox.spool() + "/index.json"));
+  CHECK(std::filesystem::exists(sandbox.spool() + "/blobs/" + info.digest.substr(7)));
+  ArtifactSpool recovered;
+  CHECK(recovered.open(sandbox.options()).ok());
+  CHECK(recovered.list().size() == 1);
+  CHECK(recovered.close().ok());
+}
+
 } // namespace
 
 int main() {
@@ -293,5 +358,8 @@ int main() {
     garbage_collection();
     recovery_rebuilds_index();
     rejects_foreign_files();
+    bounded_cancellable_fetch();
+    destructor_releases_lock();
+    cancellable_recovery();
   });
 }

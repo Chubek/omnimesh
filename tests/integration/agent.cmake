@@ -118,6 +118,48 @@ if(NOT staged STREQUAL "verified agent image payload\n")
   message(FATAL_ERROR "Staged image content mismatch")
 endif()
 run_agent(3 run "${image}/workload.json" ${image_options} --state-dir "${image}/session")
+set(spool "${image}/spool")
+file(WRITE "${image}/dataset" "verified spool input payload\n")
+file(SHA256 "${image}/dataset" input_hex)
+execute_process(COMMAND "${CLI}" artifact put "${image}/dataset"
+  --spool-dir "${spool}" --tenant local
+  RESULT_VARIABLE result OUTPUT_VARIABLE output ERROR_VARIABLE errors TIMEOUT 15)
+if(NOT result EQUAL 0)
+  message(FATAL_ERROR "Cannot publish input fixture: ${output}${errors}")
+endif()
+string(REPLACE "\"spec\": {"
+  "\"spec\": {\"inputs\":[{\"name\":\"dataset\",\"digest\":\"sha256:${input_hex}\"}],"
+  input_workload "${image_workload}")
+string(REPLACE "/fixture/image" "/fixture/inputs" input_workload "${input_workload}")
+file(WRITE "${image}/input-workload.json" "${input_workload}")
+run_agent(2 run "${image}/input-workload.json" ${image_options}
+  --state-dir "${image}/no-spool")
+run_agent(2 run "${image}/input-workload.json" ${image_options}
+  --state-dir "${image}/bad-bound" --max-input-bytes 32)
+run_agent(2 run "${image}/input-workload.json" ${image_options}
+  --state-dir "${image}/bad-bound" --spool-dir "${spool}" --max-input-bytes -1)
+run_agent(2 run "${image}/input-workload.json" ${image_options}
+  --state-dir "${image}/bad-bound" --spool-dir "${spool}" --max-input-bytes 0)
+run_agent(2 run "${image}/workload.json" ${image_options}
+  --state-dir "${image}/unused-spool" --spool-dir "${spool}")
+run_agent(0 run "${image}/input-workload.json" ${image_options}
+  --state-dir "${image}/input-session" --spool-dir "${spool}" --max-input-bytes 64)
+if(NOT last_output MATCHES "verified spool input payload" OR
+   NOT last_output MATCHES "\"digest\": \"sha256:${input_hex}\"" OR
+   NOT last_output MATCHES "/tmp/omnimesh-inputs/dataset" OR
+   NOT last_output MATCHES "\"manifestDigest\": \"sha256:${manifest_hex}\"")
+  message(FATAL_ERROR "Verified image and input did not reach execution: ${last_output}")
+endif()
+file(READ "${image}/input-session/inputs/dataset" input_staged)
+if(NOT input_staged STREQUAL "verified spool input payload\n")
+  message(FATAL_ERROR "Staged input content mismatch")
+endif()
+run_agent(3 run "${image}/input-workload.json" ${image_options}
+  --state-dir "${image}/input-quota" --spool-dir "${spool}" --max-input-bytes 1)
+if(NOT last_output MATCHES "\"state\": \"Cancelled\"" OR
+   EXISTS "${image}/input-quota/bundle-1")
+  message(FATAL_ERROR "Input quota failure reached execution: ${last_output}")
+endif()
 # Modifying an already-consumed layout is detected in a new session.
 file(APPEND "${image}/layout/blobs/sha256/${layer_hex}" "corruption")
 run_agent(2 run "${image}/workload.json" ${image_options} --state-dir "${image}/corrupt")

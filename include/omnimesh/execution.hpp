@@ -2,6 +2,7 @@
 #include "omnimesh/orchestrator.hpp"
 #include "omnimesh/process.hpp"
 #include "omnimesh/images.hpp"
+#include "omnimesh/artifacts.hpp"
 #include <functional>
 namespace omnimesh {
 struct RuntimeState {
@@ -40,6 +41,8 @@ struct LocalExecutionOptions {
   // Extracted once into state_directory/rootfs before any reservation or launch.
   std::string image_layout;
   std::uint64_t max_image_bytes{kMaxImageBytes};
+  std::string spool_directory{};
+  std::uint64_t max_input_bytes{kDefaultSpoolCapacityBytes};
 };
 struct WorkerResult {
   std::string attempt_id;
@@ -59,6 +62,9 @@ struct LocalExecutionResult {
   std::string rootfs_directory;
   bool image_verified{false};
   UnpackReport image;
+  std::string input_directory;
+  bool inputs_verified{false};
+  std::vector<ArtifactInfo> inputs;
 };
 // Foreground local agent; one active worker at a time, replicas queue. Caller
 // is a trusted local administrator. Callback is checked between bounded
@@ -72,5 +78,6 @@ LocalExecutionResult execute_local(const Workload &workload, const Node &node,
                                    const LocalExecutionOptions &options,
                                    const std::function<bool()> &cancelled = {});
 Status prepare_bundle(const Workload &workload, const Allocation &allocation,
-                      const std::string &rootfs, const std::string &bundle);
+                      const std::string &rootfs, const std::string &bundle,
+                      const std::string &input_directory = {});
 } // namespace omnimesh

@@ -1,10 +1,10 @@
 # OmniMesh
 
 OmniMesh is a distributed execution platform built around OCI-compatible
-container execution and image distribution. The sixth implementation
-regiment connects digest-verified local OCI layouts directly to node-agent
-execution, with bounded staging and cancellation before launch.
-See [the regiment contract](docs/sixth-regiment.md).
+container execution and image distribution. The seventh implementation
+regiment connects digest-pinned workload inputs from the local artifact spool
+to read-only worker mounts, with bounded staging and cancellation before launch.
+See [the regiment contract](docs/seventh-regiment.md).
 
 ## Build and test
 
@@ -27,7 +27,8 @@ by `images` and `image` cases in `cli`. See
 [the durable-execution contract](docs/third-regiment.md),
 [the spool contract](docs/fourth-regiment.md) and
 [the image contract](docs/fifth-regiment.md) and
-[verified image execution](docs/sixth-regiment.md).
+[verified image execution](docs/sixth-regiment.md) and
+[workload artifact inputs](docs/seventh-regiment.md).
 
 ## What works
 
@@ -111,10 +112,16 @@ omnimesh artifact gc --spool-dir /absolute/path/to/spool --keep sha256:<64 hex>
 
 The local spool publishes immutable content-addressed blobs, re-hashes on
 every fetch, enforces tenant labels and quotas, and collects unreferenced
-blobs on demand. Tampered blobs fail closed and are preserved. Workload
-manifests declare no artifact inputs and nothing stages spool blobs into
-workers; registry access and cross-node transfer remain later work. See
-[the spool contract](docs/fourth-regiment.md).
+blobs on demand. Tampered blobs fail closed and are preserved. Workloads may
+declare up to 32 `spec.inputs` entries with unique `name` and immutable `digest`
+fields. Pass `--spool-dir` to the node agent to verify and copy them into the
+fresh session before allocation. Every attempt sees them read-only at
+`/tmp/omnimesh-inputs/<name>`. `--max-input-bytes` bounds total staged bytes
+(default and maximum 256 MiB); individual blobs remain bounded at 64 MiB.
+Both provisioned rootfs and verified image execution support inputs. Registry
+access, cross-node transfer and output collection remain later work. See
+[the spool contract](docs/fourth-regiment.md) and
+[the input execution contract](docs/seventh-regiment.md).
 
 ## Image loading
 

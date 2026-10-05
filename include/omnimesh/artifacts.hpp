@@ -3,6 +3,7 @@
 #include "omnimesh/manifest.hpp"
 
 #include <cstdint>
+#include <functional>
 #include <map>
 #include <mutex>
 #include <set>
@@ -45,6 +46,11 @@ struct CollectReport {
   std::uint64_t reclaimed_bytes{0};
 };
 
+struct FetchOptions {
+  std::uint64_t max_bytes{kMaxArtifactBytes};
+  std::function<bool()> cancelled;
+};
+
 // Content-addressed local spool. Blobs are immutable once published: `put`
 // hashes while streaming and publishes atomically, and `fetch` re-hashes
 // while reading and fails closed on mismatch, preserving the stored blob.
@@ -57,10 +63,12 @@ struct CollectReport {
 class ArtifactSpool {
 public:
   ArtifactSpool() = default;
+  ~ArtifactSpool();
   ArtifactSpool(const ArtifactSpool &) = delete;
   ArtifactSpool &operator=(const ArtifactSpool &) = delete;
 
-  Status open(const SpoolOptions &options);
+  Status open(const SpoolOptions &options,
+              const std::function<bool()> &cancelled = {});
   Status close();
 
   Status put(const std::string &path, const std::string &tenant,
@@ -68,7 +76,7 @@ public:
   Status put_bytes(std::string_view data, const std::string &tenant,
                    ArtifactInfo &info);
   Status fetch(const std::string &digest, const std::string &tenant,
-               const std::string &out_path);
+               const std::string &out_path, const FetchOptions &options = {});
   Status fetch_bytes(const std::string &digest, const std::string &tenant,
                      std::string &data);
   Status inspect(const std::string &digest, ArtifactInfo &info) const;
@@ -79,7 +87,7 @@ public:
 
 private:
   Status save_index();
-  Status reconcile();
+  Status reconcile(const std::function<bool()> &cancelled);
   std::string blob_path(const std::string &hex) const;
 
   mutable std::mutex mutex_;

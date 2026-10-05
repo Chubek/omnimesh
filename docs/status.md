@@ -57,8 +57,8 @@ at publish, mandatory re-hash at fetch, atomic synced publication, 64 MiB
 per-blob and 256 MiB/1024-blob default quotas, tenant labels enforced on
 fetch, index rebuild by re-hashing on open, and `gc` with reclaimed-byte
 accounting. Tampered blobs fail closed and are preserved, never served.
-Workload-declared inputs, registry access and cross-node
-transfer are not implemented.
+The seventh regiment wires workload-declared inputs into local workers;
+registry access, cross-node transfer and output collection remain unimplemented.
 
 **Image loading and verification** — `src/supporting/images/module.cpp`,
 `src/supporting/images/tar.cpp`, `src/common/gzip.cpp` and `tools/main.cpp`
@@ -73,7 +73,7 @@ components or symlink traversal; devices, fifos and sparse files rejected;
 setuid/setgid stripped; ownership and timestamps not applied; OCI whiteouts
 and opaque directories honored. Failed unpacks leave the partial tree for
 inspection and never reuse a rootfs. No registry access, signatures, Docker
-formats, zstd layers, image building, or spool input wiring. The sixth regiment
+formats, zstd layers or image building. The sixth regiment
 adds cooperative preparation cancellation and aggregate stored/archive byte
 bounds across all layers, including tar padding.
 
@@ -96,6 +96,19 @@ preparation, and failures retain the partial tree but create no attempt or
 reservation. Result JSON reports verification and image identities. See
 `docs/sixth-regiment.md` for the fixed process profile, limits and compatibility
 corrections to fifth-regiment layout paths and descriptor sizes.
+
+**Workload artifact inputs** — `spec.inputs` declares up to 32 uniquely named
+SHA-256 blobs. The agent's `--spool-dir` opens a private local spool, checks
+tenant labels, and streams verified copies into `SESSION/inputs` before any
+reservation or runtime operation. Per-blob bounds and a configurable aggregate
+bound apply; aliases count separately. Cancellation covers spool reconciliation
+and copying. Replicas and retries share the protected snapshot through a
+`ro,nosuid,nodev,noexec` bind mount at `/tmp/omnimesh-inputs`. Results report
+prepared digests and sizes. Missing, corrupt, unauthorized or oversized inputs
+cancel desired state without attempts. Journal recovery preserves declarations
+and cancellation but never reuses old snapshots or restarts work. See
+`docs/seventh-regiment.md`. Tenant labels depend on the trusted local caller;
+they do not establish authenticated tenant isolation.
 
 **Experimental control-plane journal** — `src/control-plane/storage/module.cpp`
 and `src/control-plane/api/module.cpp`. Single-writer, versioned, checksummed,

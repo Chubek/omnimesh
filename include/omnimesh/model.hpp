@@ -17,6 +17,7 @@ inline constexpr std::size_t kMaxAllocations = 8192;
 inline constexpr std::size_t kMaxDiagnosticNodes = 16;
 inline constexpr std::size_t kMaxDiagnosticReasons = 8;
 inline constexpr std::uint32_t kMaxReplicas = 256;
+inline constexpr std::size_t kMaxWorkloadInputs = 32;
 
 struct Resources {
   std::uint64_t cpu_millis{0};
@@ -37,6 +38,13 @@ struct RetryPolicy {
   std::uint32_t backoff_millis{1000};
 };
 
+struct ArtifactInput {
+  std::string name;
+  std::string digest;
+};
+
+bool operator==(const ArtifactInput& left, const ArtifactInput& right);
+
 struct Workload {
   std::string name;
   std::string tenant{"local"};
@@ -50,6 +58,7 @@ struct Workload {
   std::map<std::string, std::string> node_selector;
   std::vector<std::string> capabilities;
   RetryPolicy retry;
+  std::vector<ArtifactInput> inputs;
 };
 
 bool operator==(const Workload& left, const Workload& right);

@@ -65,6 +65,27 @@ properties:
         minimum: 1
         maximum: 256
         default: 1
+      inputs:
+        type: array
+        maxItems: 32
+        default: []
+        description: >-
+          Digest-pinned local spool blobs. Names must be unique. The foreground
+          agent requires --spool-dir, verifies tenant labels and contents, and
+          stages at most --max-input-bytes before allocation. Each file appears
+          read-only at /tmp/omnimesh-inputs/<name> in every attempt. No extraction,
+          arbitrary destination paths, network transfer or output collection.
+        items:
+          type: object
+          additionalProperties: false
+          required: [name, digest]
+          properties:
+            name:
+              type: string
+              pattern: '^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$'
+            digest:
+              type: string
+              pattern: '^sha256:[0-9a-f]{64}$'
       privileged:
         const: false
         description: Privileged execution is unsupported and rejected.
