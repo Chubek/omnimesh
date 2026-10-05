@@ -45,7 +45,10 @@ properties:
         maxLength: 1024
         description: >-
           Immutable OCI digest. A mutable tag is rejected; record the resolved
-          digest before an attempt starts.
+          digest before an attempt starts. With local --image-layout execution,
+          this identifies the selected image manifest, not the image index;
+          the agent verifies it before preparing any attempt. With --rootfs,
+          the administrator is responsible for the image-to-rootfs relationship.
       command:
         type: array
         minItems: 1
@@ -55,7 +58,8 @@ properties:
           maxLength: 4096
         description: >-
           argv vector. The first entry must be nonempty; every entry must be free
-          of embedded NUL. No shell expansion is performed.
+          of embedded NUL. No shell expansion is performed. Local execution uses
+          this complete argv rather than image Entrypoint or Cmd defaults.
       replicas:
         type: integer
         minimum: 1

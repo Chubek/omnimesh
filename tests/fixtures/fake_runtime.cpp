@@ -54,6 +54,16 @@ int main(int argc, char **argv) {
       if (mode == "/fixture/args") {
         std::cout << args.dump();
       }
+      if (mode == "/fixture/image") {
+        // Observe the staged tree through the actual bundle root, without
+        // pretending that this protocol fixture provides container isolation.
+        const std::string rootfs = config["root"]["path"];
+        std::ifstream payload(rootfs + "/bin/hello");
+        if (!payload || config["root"]["readonly"] != true) {
+          return 1;
+        }
+        std::cout << payload.rdbuf();
+      }
       for (int i = 0; i < 30; ++i) {
         if (stopped && mode != "/fixture/ignore-term" &&
             mode != "/fixture/unstoppable") {

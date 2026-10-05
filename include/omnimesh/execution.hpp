@@ -1,6 +1,7 @@
 #pragma once
 #include "omnimesh/orchestrator.hpp"
 #include "omnimesh/process.hpp"
+#include "omnimesh/images.hpp"
 #include <functional>
 namespace omnimesh {
 struct RuntimeState {
@@ -27,8 +28,7 @@ private:
 };
 struct LocalExecutionOptions {
   std::string runtime_executable;
-  std::string
-      rootfs; // Trusted pre-provisioned rootfs; no image loading implied.
+  std::string rootfs; // Trusted pre-provisioned rootfs, exclusive with image_layout.
   std::string state_directory;
   std::uint32_t timeout_millis{60000}; // Whole session, including retries.
   std::uint32_t grace_millis{1000};
@@ -36,6 +36,10 @@ struct LocalExecutionOptions {
   // recorded to this directory before the mutations and external operations
   // they describe; a journal failure stops the session fail-closed.
   std::string journal_directory;
+  // Local OCI layout; the workload image digest pins the selected manifest.
+  // Extracted once into state_directory/rootfs before any reservation or launch.
+  std::string image_layout;
+  std::uint64_t max_image_bytes{kMaxImageBytes};
 };
 struct WorkerResult {
   std::string attempt_id;
@@ -52,6 +56,9 @@ struct LocalExecutionResult {
   std::string session_directory;
   bool journaled{false};
   std::uint64_t journal_records{0};
+  std::string rootfs_directory;
+  bool image_verified{false};
+  UnpackReport image;
 };
 // Foreground local agent; one active worker at a time, replicas queue. Caller
 // is a trusted local administrator. Callback is checked between bounded

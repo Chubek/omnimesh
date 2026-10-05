@@ -84,6 +84,8 @@ LocalExecutionResult execute_local(const Workload &workload, const Node &node,
                                    const LocalExecutionOptions &options,
                                    const std::function<bool()> &cancelled) {
   LocalExecutionResult result;
+  const auto deadline =
+      MonotonicClock::now() + std::chrono::milliseconds(options.timeout_millis);
   Allocator allocator;
   WorkloadController controller(allocator);
   LocalAuthority authority;
@@ -135,6 +137,17 @@ LocalExecutionResult execute_local(const Workload &workload, const Node &node,
   if (node.platform.architecture != host_architecture()) {
     return finish({StatusCode::unavailable,
                    "node architecture does not match this host"});
+  }
+  const bool from_image = !options.image_layout.empty();
+  if (options.rootfs.empty() == options.image_layout.empty()) {
+    return finish({StatusCode::invalid_argument,
+                   "select exactly one of rootfs or image layout"});
+  }
+  if (from_image &&
+      (options.max_image_bytes < 1024ULL * 1024ULL ||
+       options.max_image_bytes > 16ULL * 1024ULL * 1024ULL * 1024ULL)) {
+    return finish(
+        {StatusCode::invalid_argument, "image byte bound is out of range"});
   }
   auto status = Status::Ok();
   if (journal) {
@@ -198,17 +211,18 @@ LocalExecutionResult execute_local(const Workload &workload, const Node &node,
                    "select an executable OCI runtime using an absolute path"});
   }
   std::error_code error;
-  if (options.rootfs.empty() || options.rootfs.front() != '/' ||
-      options.rootfs.find('\0') != std::string::npos ||
-      options.rootfs.size() > 4096) {
-    return finish(
-        {StatusCode::invalid_argument, "rootfs must be an absolute path"});
+  const auto &source = from_image ? options.image_layout : options.rootfs;
+  if (source.empty() || source.front() != '/' ||
+      source.find('\0') != std::string::npos || source.size() > 4096) {
+    return finish({StatusCode::invalid_argument,
+                   "rootfs or image layout must be an absolute path"});
   }
-  const auto rootfs = std::filesystem::canonical(options.rootfs, error);
-  if (error || rootfs == "/" || !std::filesystem::is_directory(rootfs)) {
+  const auto source_path = std::filesystem::canonical(source, error);
+  if (error || source_path == "/" ||
+      !std::filesystem::is_directory(source_path, error) || error) {
     return finish(
         {StatusCode::invalid_argument,
-         "rootfs must be a trusted provisioned directory other than /"});
+         "rootfs or image layout must be an existing directory other than /"});
   }
   if (options.state_directory.empty() ||
       options.state_directory.front() != '/' ||
@@ -219,11 +233,19 @@ LocalExecutionResult execute_local(const Workload &workload, const Node &node,
   }
   const auto state_path =
       std::filesystem::weakly_canonical(options.state_directory, error);
-  if (error || state_path == rootfs ||
-      state_path.string().compare(0, rootfs.string().size() + 1,
-                                  rootfs.string() + "/") == 0) {
-    return finish({StatusCode::invalid_argument,
-                   "state directory must be outside the rootfs"});
+  if (error || state_path == source_path ||
+       state_path.string().compare(0, source_path.string().size() + 1,
+                                   source_path.string() + "/") == 0) {
+    return finish(
+        {StatusCode::invalid_argument,
+         "state directory must be outside the rootfs or image layout"});
+  }
+  if (from_image) {
+    const auto placement =
+        propose_placement(requirements_for(workload), allocator.snapshot());
+    if (!placement.status.ok()) {
+      return finish(placement.status);
+    }
   }
   // An exclusive private session directory is also a restart barrier. Existing
   // state is never overwritten or guessed to be safe after a crash.
@@ -233,14 +255,46 @@ LocalExecutionResult execute_local(const Workload &workload, const Node &node,
                                "existing runtime state before recovery"});
   }
   result.session_directory = state_path.string();
+  auto rootfs = source_path;
+  if (from_image) {
+    rootfs = state_path / "rootfs";
+    UnpackOptions unpack;
+    unpack.layout_directory = source_path.string();
+    unpack.rootfs_directory = rootfs.string();
+    unpack.platform = {node.platform.os, node.platform.architecture};
+    const auto at = workload.image.rfind('@');
+    unpack.expected_digest = at == std::string::npos
+                                 ? workload.image
+                                 : workload.image.substr(at + 1);
+    unpack.max_bytes = options.max_image_bytes;
+    bool preparation_cancelled = false;
+    unpack.cancelled = [&] {
+      preparation_cancelled = preparation_cancelled ||
+                              MonotonicClock::now() >= deadline ||
+                              (cancelled && cancelled());
+      return preparation_cancelled;
+    };
+    result.rootfs_directory = rootfs.string();
+    ImageLoader loader;
+    status = loader.unpack(unpack, result.image);
+    if (!status.ok()) {
+      const auto failure = status;
+      status = note_cancellation();
+      if (!status.ok()) {
+        return finish(status);
+      }
+      controller.cancel(workload_id, workload.tenant);
+      return finish(failure);
+    }
+    result.image_verified = true;
+  }
+  result.rootfs_directory = rootfs.string();
   const auto runtime_root = result.session_directory + "/runtime";
   if (mkdir(runtime_root.c_str(), 0700) != 0) {
     return finish(
         {StatusCode::internal, "cannot create private runtime state"});
   }
   OciRuntime runtime(options.runtime_executable, runtime_root);
-  const auto deadline =
-      MonotonicClock::now() + std::chrono::milliseconds(options.timeout_millis);
   bool session_cancelled = false;
   bool cleanup_failed = false;
   std::size_t ordinal = 0;

@@ -57,26 +57,30 @@ at publish, mandatory re-hash at fetch, atomic synced publication, 64 MiB
 per-blob and 256 MiB/1024-blob default quotas, tenant labels enforced on
 fetch, index rebuild by re-hashing on open, and `gc` with reclaimed-byte
 accounting. Tampered blobs fail closed and are preserved, never served.
-Workload-declared inputs, registry access, image loading and cross-node
+Workload-declared inputs, registry access and cross-node
 transfer are not implemented.
 
 **Image loading and verification** — `src/supporting/images/module.cpp`,
 `src/supporting/images/tar.cpp`, `src/common/gzip.cpp` and `tools/main.cpp`
 (`image inspect/unpack`). Local OCI image-layout validation with exact
 media-type matches, platform selection and optional manifest pinning; every
-blob verified by digest while streaming and every layer matched against its
-diff ID. In-tree DEFLATE/gzip decoder with incremental bounds and trailer
+consumed blob verified by digest and descriptor size while streaming and every
+unpacked layer matched against its diff ID. Standard `blobs/sha256/<hex>`
+paths, duplicate-key rejection and digest-aware selection across same-platform
+manifests. In-tree DEFLATE/gzip decoder with incremental bounds and trailer
 verification. Root-confined tar extraction: no absolute paths, `..`
 components or symlink traversal; devices, fifos and sparse files rejected;
 setuid/setgid stripped; ownership and timestamps not applied; OCI whiteouts
 and opaque directories honored. Failed unpacks leave the partial tree for
 inspection and never reuse a rootfs. No registry access, signatures, Docker
-formats, zstd layers, image building, or worker input wiring.
+formats, zstd layers, image building, or spool input wiring. The sixth regiment
+adds cooperative preparation cancellation and aggregate stored/archive byte
+bounds across all layers, including tar padding.
 
 **Local execution and worker supervision** — `src/execution-plane/agent/module.cpp`,
 `src/execution-plane/worker/module.cpp`, `src/runtime/omnirun/module.cpp` and
 `tools/node_agent.cpp`. Generates private OCI 1.0.2 bundles from trusted
-pre-provisioned rootfs directories, invokes an explicit runc/crun CLI protocol,
+pre-provisioned rootfs directories or verified local OCI layouts, invokes an explicit runc/crun CLI protocol,
 queues replicas, reconciles runtime observations, retains retry history, captures
 bounded output, and handles cancellation with TERM/KILL deadlines. A matching
 runtime stopped state is required before resource release. A host-user authority
@@ -84,6 +88,14 @@ lock and recovery barrier prevent overlapping sessions and automatic restart
 following uncertain execution. Tested with a compiled protocol fixture; real
 runtime compatibility and resource enforcement remain unverified when the
 optional `oci-runtime` suite skips.
+
+**Verified image execution** — `--image-layout` pins the workload manifest digest,
+verifies and stages `SESSION/rootfs` before any reservation or runtime call.
+Replicas/retries share that read-only tree. Whole-session deadlines cover
+preparation, and failures retain the partial tree but create no attempt or
+reservation. Result JSON reports verification and image identities. See
+`docs/sixth-regiment.md` for the fixed process profile, limits and compatibility
+corrections to fifth-regiment layout paths and descriptor sizes.
 
 **Experimental control-plane journal** — `src/control-plane/storage/module.cpp`
 and `src/control-plane/api/module.cpp`. Single-writer, versioned, checksummed,
@@ -137,8 +149,10 @@ Frantz.
 - Local execution requires Linux and libc descriptor-close support for spawn.
   Rootless resource enforcement requires host cgroup delegation and a capable
   runtime. Unsupported limits are not removed from the generated bundle.
-- Local rootfs contents and their relationship to the requested image digest are
-  administrator-verified. The agent records an annotation, not digest proof.
+- With `--rootfs`, contents and their relationship to the requested image digest
+  are administrator-verified. With `--image-layout`, the agent verifies the
+  selected manifest and layers before use. Image process defaults are not
+  applied; the workload argv and fixed local execution profile are used.
 - The journal has no compaction, distributed lease, fencing or automated
   recovery. Failed recovery state must not be used for scheduling; `recover`
   discards it with the local objects and reports the failure.

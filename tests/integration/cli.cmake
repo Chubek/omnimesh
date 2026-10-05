@@ -121,7 +121,7 @@ run_cli(2 artifact bogus --spool-dir "${TEST_DIR}/spool")
 # The fifth-regiment image loader: build a layout with cmake, verify by CLI.
 file(MAKE_DIRECTORY "${TEST_DIR}/image/rootfs/bin")
 file(WRITE "${TEST_DIR}/image/rootfs/bin/hello" "#!/bin/sh\necho hi\n")
-file(MAKE_DIRECTORY "${TEST_DIR}/image/layout/blobs")
+file(MAKE_DIRECTORY "${TEST_DIR}/image/layout/blobs/sha256")
 execute_process(COMMAND ${CMAKE_COMMAND} -E chdir "${TEST_DIR}/image/rootfs"
   ${CMAKE_COMMAND} -E tar cf "${TEST_DIR}/image/layer.tar" bin/hello
   RESULT_VARIABLE result)
@@ -131,7 +131,7 @@ endif()
 file(SHA256 "${TEST_DIR}/image/layer.tar" layer_hex)
 file(SIZE "${TEST_DIR}/image/layer.tar" layer_size)
 file(RENAME "${TEST_DIR}/image/layer.tar"
-  "${TEST_DIR}/image/layout/blobs/${layer_hex}")
+  "${TEST_DIR}/image/layout/blobs/sha256/${layer_hex}")
 set(layer_digest "sha256:${layer_hex}")
 set(layer_diff "${layer_digest}")
 file(WRITE "${TEST_DIR}/image/config.json"
@@ -139,14 +139,14 @@ file(WRITE "${TEST_DIR}/image/config.json"
 file(SHA256 "${TEST_DIR}/image/config.json" config_hex)
 file(SIZE "${TEST_DIR}/image/config.json" config_size)
 file(RENAME "${TEST_DIR}/image/config.json"
-  "${TEST_DIR}/image/layout/blobs/${config_hex}")
+  "${TEST_DIR}/image/layout/blobs/sha256/${config_hex}")
 set(config_digest "sha256:${config_hex}")
 file(WRITE "${TEST_DIR}/image/manifest.json"
   "{\"schemaVersion\":2,\"mediaType\":\"application/vnd.oci.image.manifest.v1+json\",\"config\":{\"mediaType\":\"application/vnd.oci.image.config.v1+json\",\"digest\":\"${config_digest}\",\"size\":${config_size}},\"layers\":[{\"mediaType\":\"application/vnd.oci.image.layer.v1.tar\",\"digest\":\"${layer_digest}\",\"size\":${layer_size}}]}")
 file(SHA256 "${TEST_DIR}/image/manifest.json" manifest_hex)
 file(SIZE "${TEST_DIR}/image/manifest.json" manifest_size)
 file(RENAME "${TEST_DIR}/image/manifest.json"
-  "${TEST_DIR}/image/layout/blobs/${manifest_hex}")
+  "${TEST_DIR}/image/layout/blobs/sha256/${manifest_hex}")
 set(manifest_digest "sha256:${manifest_hex}")
 file(WRITE "${TEST_DIR}/image/layout/oci-layout" "{\"imageLayoutVersion\":\"1.0.0\"}")
 file(WRITE "${TEST_DIR}/image/layout/index.json"

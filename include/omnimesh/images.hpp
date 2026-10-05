@@ -5,6 +5,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -126,7 +127,12 @@ struct UnpackOptions {
   std::string rootfs_directory; // Created fresh; never reused.
   ImagePlatform platform;       // Empty selects the host platform.
   std::string expected_digest;  // Empty skips manifest pinning.
+  // Independently bounds total stored layers, total uncompressed tar streams
+  // (including padding), and extracted file payload across the entire image.
   std::uint64_t max_bytes{kMaxImageBytes};
+  // Checked before metadata reads and between streaming chunks. Callbacks
+  // must not throw. Cancellation leaves a partial, unusable rootfs for inspection.
+  std::function<bool()> cancelled;
 };
 
 struct UnpackReport {
@@ -134,19 +140,22 @@ struct UnpackReport {
   std::uint64_t layers{0};
   std::uint64_t files{0};
   std::uint64_t bytes{0};
+  std::string config_digest;
 };
 
 // Local OCI image-layout loader (no registry access). Every blob is
-// verified by digest while streaming; descriptors use exact media-type
+// verified by digest and size while streaming; descriptors use exact media-type
 // matches; the selected platform must match the image config; and each
 // layer's uncompressed identity must match the config's diff_id chain.
-// `inspect` reports the selected manifest without extracting. `unpack`
+// OCI blobs are read from blobs/sha256/<hex>. `inspect` verifies the manifest
+// and config and reports layer descriptors without reading layers. `unpack`
 // applies layers in order into a fresh directory. A failed unpack leaves
 // the partial tree for inspection and never reuses it.
 class ImageLoader {
 public:
   Status inspect(const std::string &layout, const ImagePlatform &select,
-                 const std::string &expected_digest, ImageSummary &summary);
+                 const std::string &expected_digest, ImageSummary &summary,
+                 const std::function<bool()> &cancelled = {});
   Status unpack(const UnpackOptions &options, UnpackReport &report);
 };
 

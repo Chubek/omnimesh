@@ -64,7 +64,12 @@ node-agent CLI -> controller -> allocator -> private OCI bundle -> runtime run
                      +---- ordered state observations <-+--- state ---+
 ```
 
-`execute_local` operates on trusted local inventory and a provisioned rootfs.
+`execute_local` operates on trusted local inventory and either a provisioned
+rootfs or a local OCI layout. For a layout, the supporting-service loader
+verifies the workload's manifest pin and stages a private session rootfs
+before any reservation. Preparation shares the session deadline and is
+cancelled cooperatively; failures cannot reach the runtime. The verified tree
+is read-only for every replica and retry in that session.
 It reserves one worker at a time and issues `begin_start` before invoking the
 runtime. Runtime state provides execution acknowledgment. A stopped state must
 match the container identity before terminal observation releases accounting.
@@ -100,5 +105,5 @@ runtime adapter, the execution plane contains a content-addressed artifact
 spool with no worker input wiring, and supporting services contain a local
 image-layout loader with no registry behind it. `docs/status.md`,
 `docs/third-regiment.md`, `docs/fourth-regiment.md` and
-`docs/fifth-regiment.md` document tested behavior, compatibility limitations
+`docs/fifth-regiment.md` and `docs/sixth-regiment.md` document tested behavior, compatibility limitations
 and manual recovery.

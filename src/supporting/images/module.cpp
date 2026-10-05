@@ -6,6 +6,7 @@
 #include <cstring>
 #include <fcntl.h>
 #include <nlohmann/json.hpp>
+#include <set>
 #include <sys/stat.h>
 #include <sys/utsname.h>
 #include <unistd.h>
@@ -24,14 +25,28 @@ Status bad_layout(const std::string &what) {
   return {StatusCode::invalid_argument, "invalid image layout: " + what};
 }
 
+Status check_cancelled(const std::function<bool()> &cancelled) {
+  if (cancelled && cancelled()) {
+    return {StatusCode::unavailable,
+            "image preparation cancelled or exceeded its deadline"};
+  }
+  return Status::Ok();
+}
+
 // Reads an entire small file with a bound. Larger blobs stream elsewhere.
 Status read_bounded(const std::string &path, std::uint64_t bound,
-                    std::string &data) {
+                     std::string &data,
+                     const std::function<bool()> &cancelled) {
+  auto status = check_cancelled(cancelled);
+  if (!status.ok()) {
+    return status;
+  }
   if (path.empty() || path.size() > 4096 ||
       path.find('\0') != std::string::npos) {
     return {StatusCode::invalid_argument, "invalid layout path"};
   }
-  const int fd = ::open(path.c_str(), O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+  const int fd =
+      ::open(path.c_str(), O_RDONLY | O_NONBLOCK | O_NOFOLLOW | O_CLOEXEC);
   if (fd < 0) {
     return io_error("cannot open layout file");
   }
@@ -44,6 +59,11 @@ Status read_bounded(const std::string &path, std::uint64_t bound,
   char chunk[65536];
   std::uint64_t total = 0;
   while (true) {
+    status = check_cancelled(cancelled);
+    if (!status.ok()) {
+      ::close(fd);
+      return status;
+    }
     const ssize_t count = read(fd, chunk, sizeof(chunk));
     if (count < 0) {
       ::close(fd);
@@ -70,15 +90,21 @@ Status parse_json(const std::string &text, const std::string &what,
     return bad_layout(what + " is empty or too large");
   }
   std::size_t tokens = 0;
+  std::vector<std::set<std::string>> keys;
   try {
     const auto callback = [&](int depth, Json::parse_event_t event,
                               Json &parsed) {
       if (depth > 32 || ++tokens > 16384) {
         throw std::runtime_error("layout JSON exceeds its bounds");
       }
-      if (event == Json::parse_event_t::key &&
-          parsed.get<std::string>().size() > 256) {
-        throw std::runtime_error("layout JSON key is too long");
+      if (event == Json::parse_event_t::object_start) {
+        keys.emplace_back();
+      } else if (event == Json::parse_event_t::object_end) {
+        keys.pop_back();
+      } else if (event == Json::parse_event_t::key &&
+                 (parsed.get<std::string>().size() > 256 ||
+                  !keys.back().insert(parsed.get<std::string>()).second)) {
+        throw std::runtime_error("duplicate or overlong layout JSON key");
       }
       return true;
     };
@@ -116,25 +142,43 @@ Status parse_descriptor(const Json &value, const std::string &what,
   return Status::Ok();
 }
 
-// Streams a blob while hashing; the digest decides, not the byte count.
+// Streams a regular OCI blob while checking both its descriptor size and digest.
 Status read_blob(const std::string &layout, const Descriptor &wanted,
-                 std::string &data, std::uint64_t bound) {
+                  std::string &data, std::uint64_t bound,
+                  const std::function<bool()> &cancelled) {
+  auto status = check_cancelled(cancelled);
+  if (!status.ok()) {
+    return status;
+  }
   if (wanted.digest.size() != 71 ||
       wanted.digest.compare(0, 7, "sha256:") != 0) {
     return bad_layout("blob digest is malformed");
   }
-  const auto path = layout + "/blobs/" + wanted.digest.substr(7);
-  const int fd = ::open(path.c_str(), O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+  if (wanted.size > bound) {
+    return {StatusCode::resource_exhausted, "image blob exceeds its bound"};
+  }
+  const auto path = layout + "/blobs/sha256/" + wanted.digest.substr(7);
+  const int fd =
+      ::open(path.c_str(), O_RDONLY | O_NONBLOCK | O_NOFOLLOW | O_CLOEXEC);
   if (fd < 0) {
     return {StatusCode::not_found,
             "image blob is missing: " + wanted.digest};
+  }
+  struct stat info{};
+  if (fstat(fd, &info) != 0 || !S_ISREG(info.st_mode) || info.st_size < 0 ||
+      static_cast<std::uint64_t>(info.st_size) != wanted.size) {
+    ::close(fd);
+    return bad_layout("blob must be a regular file matching its descriptor size");
   }
   Sha256 hash;
   data.clear();
   char chunk[65536];
   std::uint64_t total = 0;
-  Status status = Status::Ok();
   while (true) {
+    status = check_cancelled(cancelled);
+    if (!status.ok()) {
+      break;
+    }
     const ssize_t count = read(fd, chunk, sizeof(chunk));
     if (count < 0) {
       status = io_error("cannot read image blob");
@@ -144,9 +188,8 @@ Status read_blob(const std::string &layout, const Descriptor &wanted,
       break;
     }
     total += static_cast<std::uint64_t>(count);
-    if (total > bound) {
-      status = {StatusCode::resource_exhausted,
-                "image blob exceeds its bound"};
+    if (total > wanted.size) {
+      status = bad_layout("blob exceeds its descriptor size");
       break;
     }
     hash.update(chunk, static_cast<std::size_t>(count));
@@ -157,7 +200,8 @@ Status read_blob(const std::string &layout, const Descriptor &wanted,
     data.clear();
     return status;
   }
-  if ("sha256:" + Sha256::hex(hash.finish()) != wanted.digest) {
+  if (total != wanted.size ||
+      "sha256:" + Sha256::hex(hash.finish()) != wanted.digest) {
     data.clear();
     return {StatusCode::invalid_argument,
             "image blob failed digest verification: " + wanted.digest};
@@ -190,7 +234,8 @@ bool operator==(const ImagePlatform &left, const ImagePlatform &right) {
 Status ImageLoader::inspect(const std::string &layout,
                             const ImagePlatform &select,
                             const std::string &expected_digest,
-                            ImageSummary &summary) {
+                            ImageSummary &summary,
+                            const std::function<bool()> &cancelled) {
   summary = {};
   if (layout.empty() || layout.size() > 4096 ||
       layout.find('\0') != std::string::npos) {
@@ -202,7 +247,7 @@ Status ImageLoader::inspect(const std::string &layout,
   ImagePlatform want = select;
   if (want.os.empty() && want.architecture.empty()) {
     want = host_platform();
-    if (want.os.empty()) {
+    if (want.os.empty() || want.architecture.empty()) {
       return {StatusCode::unavailable,
               "host platform is unsupported; select one explicitly"};
     }
@@ -211,7 +256,7 @@ Status ImageLoader::inspect(const std::string &layout,
     return {StatusCode::invalid_argument, "invalid platform selection"};
   }
   std::string text;
-  Status status = read_bounded(layout + "/oci-layout", 4096, text);
+  Status status = read_bounded(layout + "/oci-layout", 4096, text, cancelled);
   if (!status.ok()) {
     return status;
   }
@@ -226,7 +271,7 @@ Status ImageLoader::inspect(const std::string &layout,
     return bad_layout("unsupported oci-layout version");
   }
   status = read_bounded(layout + "/index.json", kMaxImageDescriptorBytes,
-                        text);
+                        text, cancelled);
   if (!status.ok()) {
     return status;
   }
@@ -235,7 +280,10 @@ Status ImageLoader::inspect(const std::string &layout,
   if (!status.ok()) {
     return status;
   }
-  if (!index.contains("mediaType") || !index["mediaType"].is_string() ||
+  if (!index.contains("schemaVersion") ||
+      !index["schemaVersion"].is_number_unsigned() ||
+      index["schemaVersion"].get<std::uint64_t>() != 2 ||
+      !index.contains("mediaType") || !index["mediaType"].is_string() ||
       index["mediaType"].get<std::string>() != kOciIndexMediaType ||
       !index.contains("manifests") || !index["manifests"].is_array() ||
       index["manifests"].empty() || index["manifests"].size() > 256) {
@@ -243,6 +291,7 @@ Status ImageLoader::inspect(const std::string &layout,
   }
   Descriptor manifest;
   bool found = false;
+  bool platform_found = false;
   std::string available;
   for (const auto &entry : index["manifests"]) {
     Descriptor candidate;
@@ -260,31 +309,33 @@ Status ImageLoader::inspect(const std::string &layout,
             entry["platform"]["architecture"].get<std::string>();
         entry_platform = os + "/" + arch;
         matches = os == want.os && arch == want.architecture;
-      } else if (index["manifests"].size() == 1) {
+      } else if (!entry.contains("platform") && index["manifests"].size() == 1) {
         matches = true; // Single-manifest layouts may omit the platform.
       }
       if (!available.empty()) {
         available += ", ";
       }
       available += entry_platform;
-      if (matches && !found) {
+      platform_found = platform_found || matches;
+      if (matches && !found &&
+          (expected_digest.empty() || candidate.digest == expected_digest)) {
         manifest = candidate;
         found = true;
       }
     }
+  }
+  if (!found && platform_found && !expected_digest.empty()) {
+    return {StatusCode::invalid_argument,
+            "no manifest for the selected platform matches the pinned digest"};
   }
   if (!found) {
     return {StatusCode::not_found,
             "no manifest for " + want.os + "/" + want.architecture +
                 " (available: " + available + ")"};
   }
-  if (!expected_digest.empty() && manifest.digest != expected_digest) {
-    return {StatusCode::invalid_argument,
-            "selected manifest does not match the pinned digest"};
-  }
   std::string manifest_text;
   status = read_blob(layout, manifest, manifest_text,
-                     kMaxImageDescriptorBytes);
+                     kMaxImageDescriptorBytes, cancelled);
   if (!status.ok()) {
     return status;
   }
@@ -316,7 +367,8 @@ Status ImageLoader::inspect(const std::string &layout,
     return bad_layout("manifest config must be an OCI image configuration");
   }
   std::string config_text;
-  status = read_blob(layout, config, config_text, kMaxImageDescriptorBytes);
+  status = read_blob(layout, config, config_text, kMaxImageDescriptorBytes,
+                     cancelled);
   if (!status.ok()) {
     return status;
   }
@@ -394,7 +446,11 @@ Status ImageLoader::unpack(const UnpackOptions &options,
   }
   ImageSummary summary;
   Status status = inspect(options.layout_directory, options.platform,
-                          options.expected_digest, summary);
+                          options.expected_digest, summary, options.cancelled);
+  if (!status.ok()) {
+    return status;
+  }
+  status = check_cancelled(options.cancelled);
   if (!status.ok()) {
     return status;
   }
@@ -412,49 +468,78 @@ Status ImageLoader::unpack(const UnpackOptions &options,
   if (!status.ok()) {
     return status;
   }
+  std::uint64_t stored_bytes = 0, archive_bytes = 0;
   for (const auto &layer : summary.layers) {
-    const auto path = options.layout_directory + "/blobs/" +
+    status = check_cancelled(options.cancelled);
+    if (!status.ok()) {
+      return status;
+    }
+    if (layer.size > options.max_bytes - stored_bytes) {
+      return {StatusCode::resource_exhausted,
+              "image stored bytes exceed the unpack bound"};
+    }
+    const auto path = options.layout_directory + "/blobs/sha256/" +
                       layer.digest.substr(7);
-    const int fd = ::open(path.c_str(), O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+    const int fd =
+        ::open(path.c_str(), O_RDONLY | O_NONBLOCK | O_NOFOLLOW | O_CLOEXEC);
     if (fd < 0) {
       tar.close();
       return {StatusCode::not_found, "image layer is missing: " + layer.digest};
     }
+    struct stat info{};
+    if (fstat(fd, &info) != 0 || !S_ISREG(info.st_mode) || info.st_size < 0 ||
+        static_cast<std::uint64_t>(info.st_size) != layer.size) {
+      ::close(fd);
+      return bad_layout(
+          "layer must be a regular file matching its descriptor size");
+    }
     Sha256 compressed_hash, plain_hash;
+    std::uint64_t layer_bytes = 0;
     bool gzipped = layer.media_type == kOciLayerGzipMediaType;
     // Pulls compressed bytes from the blob, verifies the digest, feeds the
     // (possibly decompressed) stream to tar, and verifies the diff_id.
-    GzipReader gunzip(
-        [&](unsigned char *buffer, std::size_t capacity) -> ssize_t {
-          const ssize_t count =
-              read(fd, buffer, capacity < 65536 ? capacity : 65536);
-          if (count < 0) {
-            return -errno;
-          }
-          if (count > 0) {
-            compressed_hash.update(buffer,
-                                   static_cast<std::size_t>(count));
-          }
-          return count;
-        },
-        options.max_bytes);
+    Status source_status = Status::Ok();
+    auto source = [&](unsigned char *buffer, std::size_t capacity) -> ssize_t {
+      source_status = check_cancelled(options.cancelled);
+      if (!source_status.ok()) {
+        return -ECANCELED;
+      }
+      const ssize_t count = read(fd, buffer, capacity < 65536 ? capacity : 65536);
+      if (count < 0) {
+        source_status = io_error("cannot read image layer");
+        return -EIO;
+      }
+      const auto got = static_cast<std::uint64_t>(count);
+      if (got > layer.size - layer_bytes) {
+        source_status = bad_layout("layer exceeds its descriptor size");
+        return -EFBIG;
+      }
+      layer_bytes += got;
+      stored_bytes += got;
+      compressed_hash.update(buffer, static_cast<std::size_t>(got));
+      return count;
+    };
+    GzipReader gunzip(source, options.max_bytes - archive_bytes);
     Status layer_status = Status::Ok();
     unsigned char chunk[65536];
     while (true) {
+      layer_status = check_cancelled(options.cancelled);
+      if (!layer_status.ok()) {
+        break;
+      }
       std::size_t got = 0;
       if (gzipped) {
         layer_status = gunzip.read(chunk, sizeof(chunk), got);
       } else {
-        const ssize_t count = read(fd, chunk, sizeof(chunk));
+        const ssize_t count = source(chunk, sizeof(chunk));
         if (count < 0) {
-          layer_status = io_error("cannot read image layer");
+          layer_status = source_status;
         } else {
           got = static_cast<std::size_t>(count);
-          if (got > 0) {
-            compressed_hash.update(chunk, got);
-            plain_hash.update(chunk, got);
-          }
         }
+      }
+      if (!source_status.ok()) {
+        layer_status = source_status;
       }
       if (!layer_status.ok()) {
         break;
@@ -462,9 +547,13 @@ Status ImageLoader::unpack(const UnpackOptions &options,
       if (got == 0) {
         break;
       }
-      if (gzipped) {
-        plain_hash.update(chunk, got);
+      if (got > options.max_bytes - archive_bytes) {
+        layer_status = {StatusCode::resource_exhausted,
+                        "image archive bytes exceed the unpack bound"};
+        break;
       }
+      archive_bytes += got;
+      plain_hash.update(chunk, got);
       layer_status = tar.write(chunk, got);
       if (!layer_status.ok()) {
         break;
@@ -472,7 +561,8 @@ Status ImageLoader::unpack(const UnpackOptions &options,
     }
     ::close(fd);
     if (layer_status.ok()) {
-      if ("sha256:" + Sha256::hex(compressed_hash.finish()) != layer.digest) {
+      if (layer_bytes != layer.size ||
+          "sha256:" + Sha256::hex(compressed_hash.finish()) != layer.digest) {
         layer_status = {StatusCode::invalid_argument,
                         "layer failed digest verification: " + layer.digest};
       } else if ("sha256:" + Sha256::hex(plain_hash.finish()) !=
@@ -493,8 +583,13 @@ Status ImageLoader::unpack(const UnpackOptions &options,
   if (!status.ok()) {
     return status;
   }
+  status = check_cancelled(options.cancelled);
+  if (!status.ok()) {
+    return status;
+  }
   const auto tar_report = tar.report();
   report.manifest_digest = summary.manifest_digest;
+  report.config_digest = summary.config_digest;
   report.files = tar_report.files + tar_report.directories + tar_report.symlinks;
   report.bytes = tar_report.bytes;
   return Status::Ok();

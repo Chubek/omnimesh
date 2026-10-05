@@ -9,6 +9,7 @@
 #include <filesystem>
 #include <fstream>
 #include <functional>
+#include <nlohmann/json.hpp>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -560,13 +561,13 @@ void write_layout(const std::string &dir,
                   const std::vector<std::string> &media_types,
                   const std::string &arch = "amd64",
                   const std::vector<std::string> &diff_ids_in = {}) {
-  CHECK(std::filesystem::create_directories(dir + "/blobs"));
+  CHECK(std::filesystem::create_directories(dir + "/blobs/sha256"));
   std::ofstream(dir + "/oci-layout") << "{\"imageLayoutVersion\":\"1.0.0\"}";
   std::vector<std::string> diff_ids;
   std::string manifest_layers;
   for (std::size_t i = 0; i < layers.size(); ++i) {
     const auto hex = Sha256::hexdigest(layers[i].bytes);
-    std::ofstream(dir + "/blobs/" + hex, std::ios::binary)
+    std::ofstream(dir + "/blobs/sha256/" + hex, std::ios::binary)
         << layers[i].bytes;
     const auto diff =
         (i < diff_ids_in.size() && !diff_ids_in[i].empty()) ? diff_ids_in[i]
@@ -591,7 +592,7 @@ void write_layout(const std::string &dir,
       "\",\"os\":\"linux\",\"rootfs\":{\"type\":\"layers\",\"diff_ids\":[" +
       diff_list + "]}}";
   const auto config_hex = Sha256::hexdigest(config);
-  std::ofstream(dir + "/blobs/" + config_hex, std::ios::binary) << config;
+  std::ofstream(dir + "/blobs/sha256/" + config_hex, std::ios::binary) << config;
   const std::string manifest =
       "{\"schemaVersion\":2,\"mediaType\":\"" +
       std::string(kOciManifestMediaType) +
@@ -600,7 +601,7 @@ void write_layout(const std::string &dir,
       config_hex + "\",\"size\":" + std::to_string(config.size()) +
       "},\"layers\":[" + manifest_layers + "]}";
   const auto manifest_hex = Sha256::hexdigest(manifest);
-  std::ofstream(dir + "/blobs/" + manifest_hex, std::ios::binary) << manifest;
+  std::ofstream(dir + "/blobs/sha256/" + manifest_hex, std::ios::binary) << manifest;
   std::ofstream(dir + "/index.json") << "{\"schemaVersion\":2,\"mediaType\":\"" +
       std::string(kOciIndexMediaType) + "\",\"manifests\":[{\"mediaType\":\"" +
       std::string(kOciManifestMediaType) + "\",\"digest\":\"sha256:" +
@@ -674,7 +675,7 @@ void image_rejections() {
                  {kOciLayerTarMediaType});
     const auto hex = Sha256::hexdigest(layer.bytes);
     {
-      std::fstream blob(sandbox.root + "/layout/blobs/" + hex,
+      std::fstream blob(sandbox.root + "/layout/blobs/sha256/" + hex,
                         std::ios::binary | std::ios::in | std::ios::out);
       CHECK(static_cast<bool>(blob));
       blob.seekp(600);
@@ -750,6 +751,151 @@ void image_rejections() {
   }
 }
 
+void image_layout_contract() {
+  using Json = nlohmann::json;
+  Sandbox sandbox;
+  TarBuilder layer;
+  layer.file("app", "verified bytes");
+  layer.end();
+  const auto layout = sandbox.root + "/layout";
+  write_layout(layout, {{"l.tar", layer.bytes}}, {kOciLayerTarMediaType});
+  ImageLoader loader;
+  ImageSummary summary;
+  const ImagePlatform platform{"linux", "amd64"};
+  CHECK(loader.inspect(layout, platform, "", summary).ok());
+  const auto digest = summary.manifest_digest;
+  const auto index_text = sandbox.read(layout + "/index.json");
+  auto index = Json::parse(index_text);
+  // The requested pin may be the second image for the same platform.
+  auto other = index["manifests"][0];
+  other["digest"] = "sha256:" + std::string(64, '0');
+  index["manifests"].insert(index["manifests"].begin(), other);
+  sandbox.write(layout + "/index.json", index.dump());
+  CHECK(loader.inspect(layout, platform, digest, summary).ok());
+  CHECK(summary.manifest_digest == digest);
+
+  index = Json::parse(index_text);
+  index["manifests"][0]["size"] = 1;
+  sandbox.write(layout + "/index.json", index.dump());
+  CHECK(loader.inspect(layout, platform, digest, summary).code == StatusCode::invalid_argument);
+  index["schemaVersion"] = 1;
+  sandbox.write(layout + "/index.json", index.dump());
+  CHECK(loader.inspect(layout, platform, digest, summary).code == StatusCode::invalid_argument);
+  index = Json::parse(index_text);
+  index["manifests"][0]["platform"] = nullptr;
+  sandbox.write(layout + "/index.json", index.dump());
+  CHECK(!loader.inspect(layout, platform, digest, summary).ok());
+  // Duplicate keys are rejected instead of selecting the final value.
+  sandbox.write(layout + "/index.json", "{\"schemaVersion\":1," + index_text.substr(1));
+  CHECK(loader.inspect(layout, platform, digest, summary).code == StatusCode::invalid_argument);
+  sandbox.write(layout + "/index.json", index_text);
+
+  const auto manifest_path = layout + "/blobs/sha256/" + digest.substr(7);
+  const auto manifest_text = sandbox.read(manifest_path);
+  auto manifest = Json::parse(manifest_text);
+  auto publish_manifest = [&] {
+    const auto text = manifest.dump();
+    const auto pin = "sha256:" + Sha256::hexdigest(text);
+    sandbox.write(layout + "/blobs/sha256/" + pin.substr(7), text);
+    auto changed_index = Json::parse(index_text);
+    changed_index["manifests"][0]["digest"] = pin;
+    changed_index["manifests"][0]["size"] = text.size();
+    sandbox.write(layout + "/index.json", changed_index.dump());
+  };
+  manifest["config"]["size"] = 1;
+  publish_manifest();
+  CHECK(loader.inspect(layout, platform, "", summary).code == StatusCode::invalid_argument);
+  manifest = Json::parse(manifest_text);
+  manifest["layers"][0]["size"] = 1;
+  publish_manifest();
+  UnpackOptions options;
+  options.layout_directory = layout;
+  options.rootfs_directory = sandbox.root + "/wrong-size";
+  options.platform = platform;
+  UnpackReport report;
+  CHECK(loader.unpack(options, report).code == StatusCode::invalid_argument);
+  CHECK(report.manifest_digest.empty());
+
+  sandbox.write(layout + "/index.json", index_text);
+  // Flat pre-sixth-regiment blob paths are not OCI paths; no fallback.
+  std::filesystem::rename(manifest_path, layout + "/blobs/" + digest.substr(7));
+  CHECK(loader.inspect(layout, platform, digest, summary).code == StatusCode::not_found);
+  // A FIFO must fail promptly even with no writer attached.
+  CHECK(mkfifo(manifest_path.c_str(), 0600) == 0);
+  CHECK(loader.inspect(layout, platform, digest, summary).code == StatusCode::invalid_argument);
+  CHECK(unlink(manifest_path.c_str()) == 0);
+  sandbox.write(manifest_path, manifest_text);
+  const auto layer_path = layout + "/blobs/sha256/" + Sha256::hexdigest(layer.bytes);
+  CHECK(unlink(layer_path.c_str()) == 0);
+  CHECK(mkfifo(layer_path.c_str(), 0600) == 0);
+  options.rootfs_directory = sandbox.root + "/fifo";
+  CHECK(loader.unpack(options, report).code == StatusCode::invalid_argument);
+  CHECK(unlink((layout + "/oci-layout").c_str()) == 0);
+  CHECK(mkfifo((layout + "/oci-layout").c_str(), 0600) == 0);
+  CHECK(loader.inspect(layout, platform, digest, summary).code == StatusCode::invalid_argument);
+}
+
+void image_bounds_and_cancellation() {
+  Sandbox sandbox;
+  TarBuilder layer;
+  layer.file("payload", std::string(700000, 'x'));
+  layer.end();
+  const auto layout = sandbox.root + "/layout";
+  write_layout(layout, {{"one", layer.bytes}, {"two", layer.bytes}},
+               {kOciLayerTarMediaType, kOciLayerTarMediaType});
+  UnpackOptions options;
+  options.layout_directory = layout;
+  options.rootfs_directory = sandbox.root + "/bounded";
+  options.platform = {"linux", "amd64"};
+  options.max_bytes = 1024 * 1024;
+  ImageLoader loader;
+  UnpackReport report;
+  CHECK(loader.unpack(options, report).code == StatusCode::resource_exhausted);
+  CHECK(report.manifest_digest.empty());
+
+  options.rootfs_directory = sandbox.root + "/cancelled";
+  options.cancelled = [] { return true; };
+  CHECK(loader.unpack(options, report).code == StatusCode::unavailable);
+  CHECK(!std::filesystem::exists(options.rootfs_directory));
+  // Cancel after the first file chunk, not merely between complete layers.
+  options.cancelled = [&] {
+    std::error_code error;
+    const auto size = std::filesystem::file_size(options.rootfs_directory + "/payload", error);
+    return !error && size > 0;
+  };
+  CHECK(loader.unpack(options, report).code == StatusCode::unavailable);
+  CHECK(std::filesystem::file_size(options.rootfs_directory + "/payload") < 700000);
+  CHECK(report.manifest_digest.empty());
+  options.cancelled = {};
+  CHECK(loader.unpack(options, report).code == StatusCode::conflict);
+
+  // Padding consumes the streaming budget too, even when no files are created.
+  write_layout(sandbox.root + "/padding", {{"padding", std::string(1024 * 1024 + 512, '\0')}},
+               {kOciLayerTarMediaType});
+  options.layout_directory = sandbox.root + "/padding";
+  options.rootfs_directory = sandbox.root + "/padding-out";
+  CHECK(loader.unpack(options, report).code == StatusCode::resource_exhausted);
+
+  // Small compressed layers must not reset the cumulative archive budget.
+  const std::string gzip_layer(kGzipLayer.begin(), kGzipLayer.end());
+  write_layout(sandbox.root + "/gzip-bound",
+               std::vector<LayoutFile>(103, {"gzip", gzip_layer}),
+               std::vector<std::string>(103, kOciLayerGzipMediaType), "amd64",
+               std::vector<std::string>(103,
+                   "51155a88b518b6e7a24223ceda7f0ef81acb90aaa71c18f00ac6cdff7abff49b"));
+  options.layout_directory = sandbox.root + "/gzip-bound";
+  options.rootfs_directory = sandbox.root + "/gzip-bound-out";
+  CHECK(loader.unpack(options, report).code == StatusCode::resource_exhausted);
+  CHECK(report.layers == 102);
+  CHECK(report.manifest_digest.empty());
+  options.rootfs_directory = sandbox.root + "/gzip-cancelled";
+  options.cancelled = [&] {
+    return std::filesystem::exists(options.rootfs_directory + "/g.txt");
+  };
+  CHECK(loader.unpack(options, report).code == StatusCode::unavailable);
+  CHECK(report.manifest_digest.empty());
+}
+
 } // namespace
 
 int main() {
@@ -763,5 +909,7 @@ int main() {
     tar_longname();
     image_inspect_unpack();
     image_rejections();
+    image_layout_contract();
+    image_bounds_and_cancellation();
   });
 }

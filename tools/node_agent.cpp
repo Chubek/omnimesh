@@ -50,7 +50,8 @@ Status read(const std::string &path, std::string &document) {
   }
   return Status::Ok();
 }
-bool integer(const std::string &text, std::uint32_t &target) {
+template <typename Integer>
+bool integer(const std::string &text, Integer &target) {
   const auto parsed =
       std::from_chars(text.data(), text.data() + text.size(), target);
   return parsed.ec == std::errc{} && parsed.ptr == text.data() + text.size();
@@ -62,13 +63,15 @@ int run(int argc, char **argv) {
   }
   if (argc == 2 && std::string_view(argv[1]) == "--help") {
     std::cout << "omnimesh-node-agent run WORKLOAD.json --node NODE.json\n"
-                 "  --runtime /absolute/path/to/crun-or-runc --rootfs "
-                 "/trusted/rootfs\n"
+                 "  --runtime /absolute/path/to/crun-or-runc\n"
+                 "  (--rootfs /trusted/rootfs | --image-layout /local/oci-layout)\n"
                  "  --state-dir /fresh/private/session [--timeout-ms 60000] "
                  "[--grace-ms 1000]\n"
-                 "  [--journal-dir /durable/journal]\n"
-                 "Foreground local OCI execution. Rootfs is "
-                 "administrator-provisioned. A journal directory enables "
+                 "  [--journal-dir /durable/journal] [--max-image-bytes 1073741824]\n"
+                 "Foreground local OCI execution. Image layouts are verified "
+                 "against the workload manifest digest and staged in the session. "
+                 "--rootfs selects an administrator-provisioned tree. "
+                 "A journal directory enables "
                  "durable recording of control-plane facts before use; "
                  "recover it with `omnimesh recover`.\n";
     return 0;
@@ -83,21 +86,38 @@ int run(int argc, char **argv) {
     if (i + 1 >= argc ||
         (key != "--node" && key != "--runtime" && key != "--rootfs" &&
          key != "--state-dir" && key != "--timeout-ms" &&
-         key != "--grace-ms" && key != "--journal-dir") ||
+          key != "--grace-ms" && key != "--journal-dir" &&
+          key != "--image-layout" && key != "--max-image-bytes") ||
         !arguments.emplace(key, argv[i + 1]).second) {
       return fail({StatusCode::invalid_argument,
                    "unknown, missing or duplicate execution option"});
     }
   }
-  for (const auto *key : {"--node", "--runtime", "--rootfs", "--state-dir"}) {
+  for (const auto *key : {"--node", "--runtime", "--state-dir"}) {
     if (!arguments.count(key)) {
       return fail({StatusCode::invalid_argument,
                    std::string("required option: ") + key});
     }
   }
+  if (arguments.count("--rootfs") + arguments.count("--image-layout") != 1 ||
+      (arguments.count("--max-image-bytes") &&
+       !arguments.count("--image-layout"))) {
+    return fail({StatusCode::invalid_argument,
+                 "select exactly one of --rootfs or --image-layout; "
+                 "--max-image-bytes requires --image-layout"});
+  }
   LocalExecutionOptions options;
   options.runtime_executable = arguments.at("--runtime");
-  options.rootfs = arguments.at("--rootfs");
+  if (arguments.count("--rootfs")) {
+    options.rootfs = arguments.at("--rootfs");
+  } else {
+    options.image_layout = arguments.at("--image-layout");
+  }
+  if (arguments.count("--max-image-bytes") &&
+      !integer(arguments.at("--max-image-bytes"), options.max_image_bytes)) {
+    return fail({StatusCode::invalid_argument,
+                 "image byte bound must be unsigned bytes"});
+  }
   options.state_directory = arguments.at("--state-dir");
   if (arguments.count("--journal-dir")) {
     options.journal_directory = arguments.at("--journal-dir");
@@ -148,7 +168,17 @@ int run(int argc, char **argv) {
               {"sessionDirectory", result.session_directory},
               {"reservationsRetained", result.reservations_retained},
               {"journaled", result.journaled},
-              {"journalRecords", result.journal_records},
+               {"journalRecords", result.journal_records},
+               {"rootfs",
+                {{"path", result.rootfs_directory},
+                 {"source", options.image_layout.empty() ? "provisioned"
+                                                         : "image-layout"},
+                 {"verified", result.image_verified},
+                 {"manifestDigest", result.image.manifest_digest},
+                 {"configDigest", result.image.config_digest},
+                 {"layers", result.image.layers},
+                 {"files", result.image.files},
+                 {"bytes", result.image.bytes}}},
               {"tasks", Json::array()},
               {"workers", Json::array()}};
   for (const auto &task : result.workload.tasks) {

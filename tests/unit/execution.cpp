@@ -1,5 +1,6 @@
 #include "omnimesh/execution.hpp"
 #include "omnimesh/control_plane.hpp"
+#include "omnimesh/sha256.hpp"
 #include "test_support.hpp"
 #include <filesystem>
 #include <fstream>
@@ -40,7 +41,7 @@ struct Fixture {
   }
   LocalExecutionOptions options(const std::string &runtime,
                                 const std::string &suffix = "session") {
-    return {runtime, root + "/rootfs", root + "/" + suffix, 5000, 20, {}};
+    return {runtime, root + "/rootfs", root + "/" + suffix, 5000, 20, {}, {}};
   }
 };
 Node node() {
@@ -168,6 +169,134 @@ void journaled_execution(const std::string &runtime) {
   CHECK(!rejected.status.ok());
   CHECK(rejected.workers.empty());
   CHECK(!std::filesystem::exists(bad.state_directory));
+}
+
+void image_execution(const std::string &runtime) {
+  Fixture fixture;
+  const auto layout = fixture.root + "/layout";
+  CHECK(std::filesystem::create_directories(layout + "/blobs/sha256"));
+  auto publish = [&](const std::string &media_type, const std::string &bytes) {
+    const auto hex = Sha256::hexdigest(bytes);
+    std::ofstream file(layout + "/blobs/sha256/" + hex, std::ios::binary);
+    file << bytes;
+    file.close();
+    CHECK(static_cast<bool>(file));
+    return Json{{"mediaType", media_type}, {"digest", "sha256:" + hex}, {"size", bytes.size()}};
+  };
+  const std::string archive(1024, '\0');
+  const auto layer = publish(kOciLayerTarMediaType, archive);
+  const auto config = publish(kOciConfigMediaType,
+      Json{{"os", "linux"}, {"architecture", node().platform.architecture},
+           {"rootfs", {{"type", "layers"}, {"diff_ids", Json::array({layer["digest"]})}}}}.dump());
+  auto manifest = publish(kOciManifestMediaType,
+      Json{{"schemaVersion", 2}, {"mediaType", kOciManifestMediaType},
+           {"config", config}, {"layers", Json::array({layer})}}.dump());
+  const std::string pin = manifest["digest"];
+  manifest["platform"] = {{"os", "linux"}, {"architecture", node().platform.architecture}};
+  std::ofstream(layout + "/oci-layout") << "{\"imageLayoutVersion\":\"1.0.0\"}";
+  std::ofstream(layout + "/index.json")
+      << Json{{"schemaVersion", 2}, {"mediaType", kOciIndexMediaType},
+              {"manifests", Json::array({manifest})}};
+  auto image_options = [&](const std::string &session) {
+    auto options = fixture.options(runtime, session);
+    options.rootfs.clear();
+    options.image_layout = layout;
+    return options;
+  };
+  auto workload = spec("args");
+  workload.image = "example.local/demo@" + pin;
+  workload.replicas = 2;
+  auto options = image_options("image-session");
+  options.journal_directory = fixture.root + "/image-journal";
+  const auto result = execute_local(workload, node(), options);
+  CHECK(result.status.ok());
+  CHECK(result.image_verified);
+  CHECK(result.image.manifest_digest == pin);
+  CHECK(result.image.config_digest == config["digest"]);
+  CHECK(result.image.layers == 1);
+  CHECK(result.rootfs_directory == options.state_directory + "/rootfs");
+  CHECK(result.workers.size() == 2);
+  CHECK(!result.reservations_retained);
+  for (int i = 1; i <= 2; ++i) {
+    std::ifstream file(options.state_directory + "/bundle-" + std::to_string(i) + "/config.json");
+    const auto bundle = Json::parse(file);
+    CHECK(bundle["root"]["path"] == result.rootfs_directory);
+    CHECK(bundle["root"]["readonly"] == true);
+    CHECK(bundle["annotations"]["io.omnimesh.image"] == workload.image);
+    CHECK(bundle["process"]["args"] == workload.command);
+  }
+  CHECK(execute_local(workload, node(), options).status.code == StatusCode::conflict);
+  auto retry = spec("retry");
+  retry.image = pin; // A bare digest has the same meaning.
+  retry.retry = {2, 1};
+  const auto retried = execute_local(retry, node(), image_options("image-retry"));
+  CHECK(retried.status.ok());
+  CHECK(retried.image_verified);
+  CHECK(retried.workers.size() == 2);
+  auto reject = [&](const Workload &specification, const LocalExecutionOptions &settings) {
+    const auto rejected = execute_local(specification, node(), settings);
+    CHECK(!rejected.status.ok());
+    CHECK(!rejected.image_verified);
+    CHECK(rejected.workers.empty());
+    CHECK(!rejected.reservations_retained);
+    CHECK(!std::filesystem::exists(settings.state_directory + "/bundle-1"));
+    return rejected;
+  };
+  reject(spec("args"), image_options("wrong-pin"));
+  auto wrong_platform = workload;
+  wrong_platform.platform.architecture = node().platform.architecture == "amd64" ? "arm64" : "amd64";
+  reject(wrong_platform, image_options("wrong-platform"));
+  auto both = image_options("both");
+  both.rootfs = fixture.root + "/rootfs";
+  CHECK(reject(workload, both).status.code == StatusCode::invalid_argument);
+  auto neither = both;
+  neither.rootfs.clear();
+  neither.image_layout.clear();
+  CHECK(reject(workload, neither).status.code == StatusCode::invalid_argument);
+  auto nested = image_options("layout/session");
+  CHECK(reject(workload, nested).status.code == StatusCode::invalid_argument);
+  auto bounded = image_options("bounded");
+  bounded.max_image_bytes = 1;
+  CHECK(reject(workload, bounded).status.code == StatusCode::invalid_argument);
+
+  auto interrupted = image_options("interrupted");
+  const auto cancelled = execute_local(workload, node(), interrupted, [&] {
+    return std::filesystem::exists(interrupted.state_directory + "/rootfs");
+  });
+  CHECK(cancelled.status.code == StatusCode::unavailable);
+  CHECK(cancelled.workers.empty());
+  CHECK(!cancelled.image_verified && !cancelled.reservations_retained);
+  CHECK(cancelled.workload.tasks[0].state == TaskState::cancelled);
+  auto timed = image_options("deadline");
+  timed.timeout_millis = 10;
+  const auto timed_out = execute_local(workload, node(), timed, [&] {
+    std::this_thread::sleep_for(std::chrono::milliseconds(15));
+    return false;
+  });
+  CHECK(timed_out.status.code == StatusCode::unavailable);
+  CHECK(timed_out.workers.empty());
+  CHECK(!timed_out.image_verified && !timed_out.reservations_retained);
+
+  // Verification failure is not an execution attempt and is never retried.
+  const std::string layer_digest = layer["digest"];
+  auto damaged = archive;
+  damaged.back() = 'x';
+  std::ofstream(layout + "/blobs/sha256/" + layer_digest.substr(7), std::ios::binary) << damaged;
+  auto corrupt = image_options("corrupt");
+  corrupt.journal_directory = fixture.root + "/corrupt-journal";
+  reject(workload, corrupt);
+  DurableControlPlane reader;
+  CHECK(reader.open(corrupt.journal_directory).ok());
+  Allocator allocator;
+  WorkloadController controller(allocator);
+  const auto recovered = reader.recover(allocator, controller);
+  CHECK(recovered.status);
+  CHECK(recovered.reservations_recovered == 0);
+  CHECK(reader.close().ok());
+  CHECK(std::filesystem::exists(corrupt.state_directory + "/rootfs"));
+  // A failed preparation does not leave a runtime uncertainty barrier.
+  std::ofstream(layout + "/blobs/sha256/" + layer_digest.substr(7), std::ios::binary) << archive;
+  CHECK(execute_local(workload, node(), image_options("after-corrupt")).status.ok());
 }
 void failures(const std::string &runtime) {
   Fixture fixture;
@@ -325,6 +454,7 @@ int main(int argc, char **argv) {
     bundle_validation();
     execution(argv[1]);
     journaled_execution(argv[1]);
+    image_execution(argv[1]);
     failures(argv[1]);
     cancellation(argv[1]);
     crash_barrier(argv[1], argv[2]);

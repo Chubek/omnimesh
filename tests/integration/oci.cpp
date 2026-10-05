@@ -39,7 +39,7 @@ int main() {
   node.tenants = {"local"};
   const auto result = omnimesh::execute_local(
       workload, node,
-      {runtime, rootfs, std::string(directory) + "/session", 10000, 1000, {}});
+      {runtime, rootfs, std::string(directory) + "/session", 10000, 1000, {}, {}});
   if (!result.status.ok()) {
     std::cerr << result.status.message << "; preserved state: " << directory
               << '\n';

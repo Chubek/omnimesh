@@ -1,10 +1,10 @@
 # OmniMesh
 
 OmniMesh is a distributed execution platform built around OCI-compatible
-container execution and image distribution. The fifth implementation
-regiment adds digest-verified local image loading alongside the
-content-addressed spool and the journaled planning and execution paths.
-See [the regiment contract](docs/fifth-regiment.md).
+container execution and image distribution. The sixth implementation
+regiment connects digest-verified local OCI layouts directly to node-agent
+execution, with bounded staging and cancellation before launch.
+See [the regiment contract](docs/sixth-regiment.md).
 
 ## Build and test
 
@@ -26,7 +26,8 @@ is covered by `artifacts` and `artifact` cases in `cli`; image loading is covere
 by `images` and `image` cases in `cli`. See
 [the durable-execution contract](docs/third-regiment.md),
 [the spool contract](docs/fourth-regiment.md) and
-[the image contract](docs/fifth-regiment.md).
+[the image contract](docs/fifth-regiment.md) and
+[verified image execution](docs/sixth-regiment.md).
 
 ## What works
 
@@ -83,11 +84,20 @@ captures bounded output and handles cancellation. It confirms runtime terminatio
 before releasing reservations. Uncertain termination blocks further sessions for
 the host user until manual recovery. With `--journal-dir` it records
 control-plane facts before acting on them and fails closed on recording errors;
-`omnimesh recover` replays the journal without restarting work. The administrator
-supplies and verifies the
-rootfs; image digest annotations do not verify its contents. This profile is
+`omnimesh recover` replays the journal without restarting work. With `--rootfs`,
+the administrator supplies and verifies the tree; image digest annotations do
+not verify its contents. This profile is
 experimental and has no OCI conformance claim. See
 [execution and recovery details](docs/third-regiment.md).
+
+To prepare the rootfs directly from an OCI layout, replace `--rootfs` with
+`--image-layout /absolute/path/to/layout`. The workload's `spec.image` must
+pin that layout's selected **manifest** digest. The agent verifies and unpacks
+into `STATE_DIR/rootfs` before reserving resources or invoking the runtime;
+replicas and retries share the read-only tree. `--max-image-bytes` defaults
+to 1 GiB, and the session timeout includes preparation. Results report the
+rootfs source, verification status and verified digests. See
+[the sixth-regiment contract](docs/sixth-regiment.md).
 
 ## Artifact spool
 
@@ -113,12 +123,15 @@ omnimesh image unpack --layout /absolute/path/to/layout \
   --rootfs /absolute/path/to/fresh-rootfs --platform linux/amd64
 ```
 
-Local OCI layouts validate exactly: platform selection with optional digest
+Local OCI layouts use `blobs/sha256/<hex>` and validate platform selection with optional digest
 pinning, per-blob digest verification while streaming, diff-ID chain checks,
 and root-confined extraction that refuses escapes, strips privileges and
 honors whiteouts. The administrator can provision `--rootfs` from a verified
-unpack instead of by hand. No registry, signatures, Docker formats or zstd
-layers. See [the image contract](docs/fifth-regiment.md).
+unpack instead of by hand, or use the agent's `--image-layout` path. No registry,
+signatures, Docker formats or zstd layers. Earlier flat `blobs/<hex>` layouts
+must be migrated; descriptor sizes are now checked. See
+[the image contract](docs/fifth-regiment.md) and
+[compatibility corrections](docs/sixth-regiment.md#oci-layout-correction-and-compatibility).
 
 ## Remaining boundaries
 
