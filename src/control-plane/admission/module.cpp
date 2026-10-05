@@ -386,6 +386,47 @@ std::vector<Diagnostic> validate_node(const Node& node) {
   return diagnostics;
 }
 
+std::string encode_workload(const Workload& workload) {
+  const Json document{
+      {"apiVersion", kApiVersion},
+      {"kind", "Workload"},
+      {"metadata", {{"name", workload.name},
+                    {"tenant", workload.tenant},
+                    {"generation", workload.generation}}},
+      {"spec", {{"image", workload.image},
+                {"command", workload.command},
+                {"replicas", workload.replicas},
+                {"privileged", false},
+                {"capabilities", workload.capabilities},
+                {"resources", {{"cpuMillis", workload.resources.cpu_millis},
+                               {"memoryBytes", workload.resources.memory_bytes}}},
+                {"platform", {{"os", workload.platform.os},
+                              {"architecture", workload.platform.architecture}}},
+                {"runtime", workload.runtime},
+                {"nodeSelector", workload.node_selector},
+                {"retry", {{"maxAttempts", workload.retry.max_attempts},
+                           {"backoffMillis", workload.retry.backoff_millis}}}}}};
+  return document.dump();
+}
+
+std::string encode_node(const Node& node) {
+  const Json document{
+      {"apiVersion", kApiVersion},
+      {"kind", "Node"},
+      {"metadata", {{"name", node.id}}},
+      {"spec", {{"resources", {{"cpuMillis", node.capacity.cpu_millis},
+                                {"memoryBytes", node.capacity.memory_bytes}}},
+                {"platform", {{"os", node.platform.os},
+                              {"architecture", node.platform.architecture}}},
+                {"runtimes", node.runtimes},
+                {"tenants", node.tenants},
+                {"labels", node.labels},
+                {"capabilities", node.capabilities},
+                {"ready", node.ready},
+                {"verified", node.verified}}};
+  return document.dump();
+}
+
 ManifestResult<Workload> parse_workload(std::string_view document) {
   Decoder decoder;
   Json root;

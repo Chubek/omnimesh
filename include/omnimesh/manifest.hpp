@@ -22,6 +22,11 @@ template <typename T> struct ManifestResult {
 ManifestResult<Workload> parse_workload(std::string_view document);
 ManifestResult<Node> parse_node(std::string_view document);
 
+// Encoders emit exactly the documents parse_workload/parse_node accept, so
+// durable records are revalidated through the same admission path on recovery.
+std::string encode_workload(const Workload& workload);
+std::string encode_node(const Node& node);
+
 // Typed callers use the same structural/admission constraints as the CLI.
 std::vector<Diagnostic> validate_workload(const Workload& workload);
 std::vector<Diagnostic> validate_node(const Node& node);

@@ -74,6 +74,15 @@ public:
                  TimePoint now = MonotonicClock::now());
   Status cancel(const std::string& workload_id, const std::string& tenant);
 
+  // Recovery re-adopts a reservation that durable state proves was already
+  // committed, so an interrupted reconcile does not leak capacity. Idempotent
+  // for an identical attempt identity, and conflicting for a different node.
+  // Monotonic retry deadlines do not survive a restart, so an adopted task is
+  // immediately eligible; recovering that requires re-arming the backoff.
+  Status adopt_reservation(const std::string& task_id, const std::string& node_id,
+                           std::uint32_t attempt_number, std::uint64_t generation,
+                           const std::string& tenant);
+
 private:
   struct AttemptLocation {
     WorkloadRecord* workload{nullptr};
@@ -82,6 +91,8 @@ private:
   };
 
   AttemptLocation find_attempt(const std::string& id);
+  bool find_task(const std::string& task_id, WorkloadRecord** workload,
+                 TaskRecord** task);
   Allocator& allocator_;
   mutable std::mutex mutex_;
   std::map<std::string, WorkloadRecord> workloads_;

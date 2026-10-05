@@ -197,6 +197,72 @@ WorkloadController::AttemptLocation WorkloadController::find_attempt(const std::
   return {};
 }
 
+bool WorkloadController::find_task(const std::string& task_id, WorkloadRecord** workload,
+                                   TaskRecord** task) {
+  for (auto& entry : workloads_) {
+    for (auto& candidate : entry.second.tasks) {
+      if (candidate.id == task_id) {
+        *workload = &entry.second;
+        *task = &candidate;
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+Status WorkloadController::adopt_reservation(const std::string& task_id,
+                                            const std::string& node_id,
+                                            std::uint32_t attempt_number,
+                                            std::uint64_t generation,
+                                            const std::string& tenant) {
+  if (attempt_number == 0 || attempt_number > kMaxReplicas ||
+      generation == 0 || node_id.empty() || node_id.size() > 256) {
+    return {StatusCode::invalid_argument, "invalid recovered reservation"};
+  }
+  std::lock_guard<std::mutex> lock(mutex_);
+  WorkloadRecord* workload = nullptr;
+  TaskRecord* task = nullptr;
+  if (!find_task(task_id, &workload, &task)) {
+    return {StatusCode::not_found, "task not found"};
+  }
+  if (workload->spec.tenant != tenant) {
+    return {StatusCode::permission_denied, "task belongs to another tenant"};
+  }
+  if (generation != workload->spec.generation) {
+    return {StatusCode::conflict, "recovered reservation targets a stale generation"};
+  }
+  const std::string attempt_id = task_id + "/a" + std::to_string(attempt_number);
+  for (const auto& attempt : task->attempts) {
+    if (attempt.id == attempt_id) {
+      return attempt.node_id == node_id
+                 ? Status::Ok()
+                 : Status{StatusCode::conflict,
+                          "attempt identity already exists on another node"};
+    }
+  }
+  if (task->cancel_requested || terminal(task->state)) {
+    return {StatusCode::conflict, "task is already resolved and cannot adopt an attempt"};
+  }
+  const auto requirements = requirements_for(workload->spec);
+  ReservationRequest request{workload->spec.tenant + "/" + workload->spec.name,
+                             task_id, attempt_id, generation, node_id, requirements};
+  Allocation allocation;
+  const auto status = allocator_.reserve(request, allocation);
+  if (!status.ok()) {
+    return status;
+  }
+  AttemptRecord attempt;
+  attempt.id = attempt_id;
+  attempt.number = attempt_number;
+  attempt.generation = generation;
+  attempt.node_id = node_id;
+  attempt.allocation_id = allocation.id;
+  task->attempts.push_back(attempt);
+  task->state = TaskState::allocated;
+  return Status::Ok();
+}
+
 Status WorkloadController::begin_start(const std::string& attempt_id,
                                        const std::string& tenant) {
   std::lock_guard<std::mutex> lock(mutex_);

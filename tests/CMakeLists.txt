@@ -1,4 +1,4 @@
-foreach(suite manifest allocator scheduler orchestrator)
+foreach(suite manifest allocator scheduler orchestrator storage)
   add_executable(omnimesh-test-${suite} unit/${suite}.cpp)
   target_link_libraries(omnimesh-test-${suite} PRIVATE omnimesh-core omnimesh-json)
   target_compile_options(omnimesh-test-${suite} PRIVATE -Wall -Wextra -Wpedantic)
