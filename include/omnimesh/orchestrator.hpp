@@ -82,6 +82,18 @@ public:
                            std::uint32_t attempt_number, std::uint64_t generation,
                            const std::string& tenant);
 
+  // Records a final task outcome with no attempt attached. Only Succeeded,
+  // Failed and Cancelled are accepted, the task must be resolvable, and it must
+  // not already hold an unfinished attempt. Used to preserve resolved tasks
+  // across compaction without re-reserving released capacity. Idempotent for a
+  // task that already reached the same terminal state.
+  Status adopt_resolution(const std::string& task_id, TaskState state,
+                          const std::string& tenant);
+
+  // Live desired and observed state, for durable snapshots and compaction.
+  // Caller identities are trusted input; this is not an authorization check.
+  Status live_state(std::vector<WorkloadRecord>& records) const;
+
 private:
   struct AttemptLocation {
     WorkloadRecord* workload{nullptr};

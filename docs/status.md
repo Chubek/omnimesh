@@ -45,7 +45,8 @@ records. Backoff uses monotonic time with stable per-attempt jitter.
 
 **CLI** — `tools/main.cpp`. `validate`, `validate-node`, `plan`
 (`--journal-dir` records planning facts for later recovery), `recover`
-(replays a journal into fresh memory and reports the outcome), `artifact`
+(replays a journal into fresh memory and reports the outcome), `compact`
+(rewrites a recovered journal while retaining writer ownership), `artifact`
 (`put/get/list/gc` for the content-addressed spool) and `image`
 (`inspect/unpack` for local OCI layouts) with JSON output and
 documented exit codes.
@@ -123,20 +124,45 @@ closed on recording errors, and report the acknowledged record count;
 against failed recoveries. Reservations committed inside `reconcile` are
 recorded after the commit but before any start intent or runtime use, so
 recovery restores only recorded facts. There are still no transactional
-in-lock mutations, compaction, leases, fencing, failover or distributed
-coordination.
+in-lock mutations, leases, fencing, failover or distributed coordination.
+
+**Crash-atomic journal compaction** — `src/control-plane/storage/module.cpp`
+and `src/control-plane/api/module.cpp`, exposed as `omnimesh compact`. Rewrites
+the journal from live allocator and controller state to reclaim space within the
+16 MiB limit. The complete state must still fit that limit. The replacement is written, checksummed, fsynced
+and re-read in a sibling temporary file before the original is touched, and
+swapped in with a single `rename(2)`, so an interruption at any point leaves
+either the original or the complete replacement authoritative and never an
+empty journal. Quotas, inventory, workloads, cancellations and full ordered
+attempt history are retained; resolved tasks are preserved through the new
+`task_resolved` record, because a finished attempt cannot be re-adopted once its
+task is resolved. Compaction refuses to run when active allocation accounting
+disagrees with attempt history, when a resolved task still has an unfinished
+attempt, or when the rewritten set would still exceed the size limit.
+Unfinished attempts are restored as Unknown, so compaction never implies a
+worker is running. See `docs/eighth-regiment.md`.
+
+**Continuous journal ownership and fault handling** — the ninth regiment keeps
+the original and replacement inodes locked across rename and transfers the
+installed stream without reopening. Openers check pathname/inode identity after
+locking, rejecting descriptors retired by a concurrent compaction. Replacement
+verification rejects torn writes and missing records instead of repairing a
+partial replacement. A failed post-rename directory sync retains ownership but
+blocks append, replay and further compaction until close and recovery; reopening
+syncs the directory before acknowledgment. Deterministic syscall-injection and
+cross-process tests exercise these boundaries. See `docs/ninth-regiment.md`.
 
 ## Not implemented
 
 Registry access, tag resolution, signature verification, Docker image formats,
 zstd layers and image building; networking and message passing; discovery, enrollment and membership; authentication, authorization at
 the API boundary and credential rotation; transactionally journaled desired-state
-mutations and distributed coordination storage; controller failover, leader election, leases and fencing tokens;
-telemetry, metrics, logs and audit sinks; the OMNI score and heuristic ranking;
-priority, fairness and preemption; gang scheduling; image build, import and
-export; identity enrollment; the plugin ABI loader and the sandboxed Lua engine;
-a standalone Omnirun command, Omnibuild, OmniVMM, Omnix, Initsys, Meshbox and
-Frantz.
+mutations and distributed coordination storage; controller failover, leader
+election, leases and fencing tokens; telemetry, metrics, logs and audit sinks;
+the OMNI score and heuristic ranking; priority, fairness and preemption; gang
+scheduling; image build, import and export; identity enrollment; the plugin ABI
+loader and the sandboxed Lua engine; a standalone Omnirun command, Omnibuild,
+OmniVMM, Omnix, Initsys, Meshbox and Frantz.
 
 ## Known limitations
 
@@ -166,9 +192,17 @@ Frantz.
   are administrator-verified. With `--image-layout`, the agent verifies the
   selected manifest and layers before use. Image process defaults are not
   applied; the workload argv and fixed local execution profile are used.
-- The journal has no compaction, distributed lease, fencing or automated
-  recovery. Failed recovery state must not be used for scheduling; `recover`
-  discards it with the local objects and reports the failure.
+- The journal has no distributed lease, fencing or automated recovery. Failed
+  recovery state must not be used for scheduling; `recover` and `compact`
+  discard it with the local objects and report the failure.
+- Compaction remains an explicit maintenance operation. Contending writers are
+  excluded throughout replacement, but callers must serialize operations on a
+  journal instance and mutations while constructing its complete state snapshot.
+  There is no schema migration path for older journal versions. Superseded
+  observations are not retained; compaction restores state, not an audit log.
+  Abrupt death before rename can leave a private temporary file of at most
+  16 MiB; repeated interruptions require operator cleanup as documented in
+  `docs/ninth-regiment.md`. The existing state and journal limits still apply.
 - `Workload` updates are rejected with `conflict` rather than reconciled.
 - There is no conformance claim against any OCI specification version.
 - The plugin headers in `include/OmniMesh-Plugin.h` and

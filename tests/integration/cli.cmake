@@ -81,6 +81,61 @@ if(NOT last_output MATCHES "preserved")
   message(FATAL_ERROR "Corrupt journal was not preserved and reported: ${last_output}")
 endif()
 
+# Compaction rewrites a journal from recovered state without losing facts.
+run_cli(0 compact --journal-dir "${TEST_DIR}/journal")
+if(NOT last_output MATCHES "\"kind\": \"CompactionReport\"")
+  message(FATAL_ERROR "Compaction did not report a result: ${last_output}")
+endif()
+string(REGEX MATCH "\"recordsAfter\": ([0-9]+)" compact_records "${last_output}")
+if(NOT compact_records OR compact_records EQUAL 0)
+  message(FATAL_ERROR "Compaction produced an empty journal: ${last_output}")
+endif()
+run_cli(0 recover --journal-dir "${TEST_DIR}/journal")
+if(NOT last_output MATCHES "\"recordsSkipped\": 0")
+  message(FATAL_ERROR "Recovery after compaction was not clean: ${last_output}")
+endif()
+# Compaction must not invent running work: the reservations are recovered.
+if(NOT last_output MATCHES "\"reservationsRecovered\": 2")
+  message(FATAL_ERROR "Compaction dropped committed reservations: ${last_output}")
+endif()
+# Repeated journaled plans must accumulate against recovered accounting rather
+# than each reserving from an empty allocator, which would journal reservations
+# the node cannot satisfy and make the journal unreplayable.
+file(REMOVE_RECURSE "${TEST_DIR}/repeat")
+# Derive distinct workloads from the example, which keeps the pinned digest.
+foreach(index RANGE 1 6)
+  file(READ "${SOURCE_DIR}/manifests/example-workload.json" base_workload)
+  string(REPLACE "\"name\": \"hello\"" "\"name\": \"repeat-${index}\"" base_workload "${base_workload}")
+  string(REPLACE "\"replicas\": 2" "\"replicas\": 1" base_workload "${base_workload}")
+  file(WRITE "${TEST_DIR}/repeat-${index}.json" "${base_workload}")
+  # The example node holds four 1000-milli reservations; the fifth and sixth
+  # plans must report Queued and exit 3 rather than corrupting the journal.
+  if(index LESS 5)
+    set(expected 0)
+  else()
+    set(expected 3)
+  endif()
+  run_cli(${expected} plan "${TEST_DIR}/repeat-${index}.json"
+    --node "${SOURCE_DIR}/manifests/example-node.json"
+    --journal-dir "${TEST_DIR}/repeat")
+endforeach()
+run_cli(0 recover --journal-dir "${TEST_DIR}/repeat")
+if(NOT last_output MATCHES "\"recordsSkipped\": 0")
+  message(FATAL_ERROR "Repeated journaled plans broke replay: ${last_output}")
+endif()
+
+run_cli(2 compact)
+# A corrupt journal must not be rewritten; compaction reports and preserves it.
+file(SIZE "${TEST_DIR}/corrupt/control-plane.journal" corrupt_size_before)
+run_cli(2 compact --journal-dir "${TEST_DIR}/corrupt")
+if(NOT last_output MATCHES "preserved")
+  message(FATAL_ERROR "Compaction did not preserve a corrupt journal: ${last_output}")
+endif()
+file(SIZE "${TEST_DIR}/corrupt/control-plane.journal" corrupt_size_after)
+if(NOT corrupt_size_before EQUAL corrupt_size_after)
+  message(FATAL_ERROR "Compaction modified a corrupt journal")
+endif()
+
 # The fourth-regiment artifact spool: publish, verify, list and collect.
 file(WRITE "${TEST_DIR}/sample.txt" "hello artifacts\n")
 file(REMOVE_RECURSE "${TEST_DIR}/spool")

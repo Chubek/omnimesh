@@ -93,7 +93,21 @@ fail closed on recording errors; `omnimesh recover` replays a journal into
 fresh memory for inspection. Reservations committed inside `reconcile` are
 recorded after the commit but before any start intent or runtime use, so
 recovery restores only recorded facts. Recovery failure forbids scheduling
-against its partially reconstructed state.
+against its partially reconstructed state. A journaled `plan` recovers first, so
+successive runs accumulate against committed capacity rather than each
+reserving against an empty allocator.
+
+`omnimesh compact` rewrites a journal from that recovered state so a long-lived
+control plane can reclaim space within the 16 MiB record ceiling. The replacement is written
+and verified in a sibling temporary file and swapped in with a single
+`rename(2)`, so an interruption leaves either the original or the complete
+replacement authoritative. Compaction refuses to run when allocation accounting
+and attempt history disagree, and it restores unfinished attempts as Unknown
+rather than implying a worker is running. The ninth regiment retains locks on
+both inodes through publication and rejects stale openers after locking. Strict
+verification cannot silently repair a partial replacement; publication sync
+failures retain ownership and require close/recovery before further use.
+See `docs/eighth-regiment.md` and `docs/ninth-regiment.md`.
 
 ## Planned subsystems
 
@@ -106,5 +120,6 @@ spool with verified workload inputs mounted read-only into local workers,
 and supporting services contain a local
 image-layout loader with no registry behind it. `docs/status.md`,
 `docs/third-regiment.md`, `docs/fourth-regiment.md` and
-`docs/fifth-regiment.md`, `docs/sixth-regiment.md` and `docs/seventh-regiment.md`
+`docs/fifth-regiment.md`, `docs/sixth-regiment.md`, `docs/seventh-regiment.md` and
+`docs/eighth-regiment.md` and `docs/ninth-regiment.md`
 document tested behavior, compatibility limitations and manual recovery.

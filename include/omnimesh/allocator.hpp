@@ -67,6 +67,10 @@ public:
                  Allocation& allocation) const;
   AllocatorSnapshot snapshot() const;
 
+  // Active reservations only, for durable snapshots and compaction. Released
+  // tombstones are deliberately excluded.
+  Status active_allocations(std::vector<Allocation>& allocations) const;
+
 private:
   mutable std::mutex mutex_;
   AllocatorSnapshot accounts_;

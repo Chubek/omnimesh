@@ -26,6 +26,7 @@ void usage(std::ostream& stream) {
          << "                [--quota CPU_MILLIS MEMORY_BYTES MAX_ALLOCATIONS]\n"
          << "                [--journal-dir DIR]\n"
          << "  omnimesh recover --journal-dir DIR\n"
+         << "  omnimesh compact --journal-dir DIR\n"
          << "  omnimesh artifact put FILE --spool-dir DIR --tenant TENANT\n"
          << "  omnimesh artifact get DIGEST --spool-dir DIR --tenant TENANT --out FILE\n"
          << "  omnimesh artifact list --spool-dir DIR\n"
@@ -35,7 +36,9 @@ void usage(std::ostream& stream) {
          << "                [--digest DIGEST]\n"
          << "\nManifests use strict JSON. Commands emit JSON results.\n"
          << "Planning uses a temporary in-memory control plane; dryRun is always true.\n"
-         << "A journal directory additionally records planning facts for later recovery.\n";
+         << "A journal directory additionally records planning facts for later recovery.\n"
+         << "compact rewrites a journal from recovered state to reclaim space; it\n"
+         << "requires exclusive ownership and drops no live workload or reservation.\n";
 }
 
 Status read_document(const std::string& path, std::string& document) {
@@ -398,6 +401,53 @@ int recover_journal(const std::string& directory) {
   return 0;
 }
 
+int compact_journal(const std::string& directory) {
+  DurableControlPlane durable;
+  auto status = durable.open(directory);
+  if (!status.ok()) {
+    return fail(status);
+  }
+  Allocator allocator;
+  WorkloadController controller(allocator);
+  const auto report = durable.recover(allocator, controller);
+  if (!report.status) {
+    durable.close();
+    return fail({StatusCode::unavailable,
+                 "control-plane recovery failed; refusing to compact state that "
+                 "cannot be reconstructed"},
+                report.diagnostics);
+  }
+  const auto before = durable.stats();
+  status = durable.compact(allocator, controller);
+  const auto after = durable.stats();
+  const auto closed = durable.close();
+  if (!status.ok()) {
+    return fail(status);
+  }
+  if (!closed.ok()) {
+    return fail(closed);
+  }
+  Json output{{"apiVersion", kApiVersion},
+              {"kind", "CompactionReport"},
+              {"status", "ok"},
+              {"message",
+               "journal rewritten from recovered state; unfinished attempts are "
+               "recorded as Unknown and require fresh observations"},
+              {"recordsBefore", before.records},
+              {"recordsAfter", after.records},
+              {"bytesBefore", before.bytes},
+              {"bytesAfter", after.bytes},
+              {"reclaimedBytes",
+               before.bytes > after.bytes ? before.bytes - after.bytes : 0},
+              {"diagnostics", Json::array()}};
+  for (const auto& diagnostic : report.diagnostics) {
+    output["diagnostics"].push_back(
+        {{"path", diagnostic.path}, {"message", diagnostic.message}});
+  }
+  std::cout << output.dump(2) << '\n';
+  return 0;
+}
+
 int run(int argc, char** argv) {
   if (argc == 1 || (argc == 2 && std::string_view(argv[1]) == "--help")) {
     usage(std::cout);
@@ -409,8 +459,8 @@ int run(int argc, char** argv) {
   }
   const std::string command = argv[1];
   if (command != "validate" && command != "validate-node" &&
-      command != "plan" && command != "recover" && command != "artifact" &&
-      command != "image") {
+      command != "plan" && command != "recover" && command != "compact" &&
+      command != "artifact" && command != "image") {
     usage(std::cerr);
     return 2;
   }
@@ -420,12 +470,13 @@ int run(int argc, char** argv) {
   if (command == "image") {
     return run_image(argc, argv);
   }
-  if (command == "recover") {
+  if (command == "recover" || command == "compact") {
     if (argc != 4 || std::string_view(argv[2]) != "--journal-dir") {
       usage(std::cerr);
       return 2;
     }
-    return recover_journal(argv[3]);
+    return command == "recover" ? recover_journal(argv[3])
+                                : compact_journal(argv[3]);
   }
   if (argc < 3 || (command != "plan" && argc != 3)) {
     usage(std::cerr);
@@ -490,12 +541,24 @@ int run(int argc, char** argv) {
     return 0;
   }
   Allocator allocator;
+  WorkloadController controller(allocator);
   DurableControlPlane durable;
   const bool journal = journal_requested && command == "plan";
   if (journal) {
     status = durable.open(journal_directory);
     if (!status.ok()) {
       return fail(status);
+    }
+    // Recover before planning. Without this, each run would reserve capacity
+    // against an empty allocator and journal reservations that exceed the
+    // node's capacity, leaving a journal that cannot be replayed.
+    const auto report = durable.recover(allocator, controller);
+    if (!report.status) {
+      durable.close();
+      return fail({StatusCode::unavailable,
+                   "control-plane recovery failed; refusing to plan against a "
+                   "journal that cannot be replayed"},
+                  report.diagnostics);
     }
     // Planning facts are recorded before the mutations they describe. The
     // reservations below are the dry run's own accounting, recorded for later
@@ -533,7 +596,6 @@ int run(int argc, char** argv) {
       return fail(status);
     }
   }
-  WorkloadController controller(allocator);
   if (journal) {
     status = durable.record_workload(workload);
     if (!status.ok()) {

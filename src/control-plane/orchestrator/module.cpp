@@ -269,7 +269,50 @@ Status WorkloadController::adopt_reservation(const std::string& task_id,
   return Status::Ok();
 }
 
-Status WorkloadController::begin_start(const std::string& attempt_id,
+Status WorkloadController::adopt_resolution(const std::string &task_id,
+                                            TaskState state,
+                                            const std::string &tenant) {
+  if (state != TaskState::succeeded && state != TaskState::failed &&
+      state != TaskState::cancelled) {
+    return {StatusCode::invalid_argument, "only a terminal task state is final"};
+  }
+  std::lock_guard<std::mutex> lock(mutex_);
+  WorkloadRecord *workload = nullptr;
+  TaskRecord *task = nullptr;
+  if (!find_task(task_id, &workload, &task)) {
+    return {StatusCode::not_found, "task not found"};
+  }
+  if (workload->spec.tenant != tenant) {
+    return {StatusCode::permission_denied, "task belongs to another tenant"};
+  }
+  if (terminal(task->state)) {
+    return task->state == state ? Status::Ok()
+                                : Status{StatusCode::conflict,
+                                         "task already resolved differently"};
+  }
+  if (!task->attempts.empty() && !terminal(task->attempts.back().state)) {
+    return {StatusCode::conflict,
+            "task has an unfinished attempt and cannot be resolved without it"};
+  }
+  if (!terminal(state) && state != TaskState::succeeded) {
+    return {StatusCode::invalid_argument, "unsupported task resolution"};
+  }
+  task->state = state;
+  task->eligible_at = TimePoint{};
+  return Status::Ok();
+}
+
+Status WorkloadController::live_state(std::vector<WorkloadRecord> &records) const {
+  std::lock_guard<std::mutex> lock(mutex_);
+  records.clear();
+  records.reserve(workloads_.size());
+  for (const auto &entry : workloads_) {
+    records.push_back(entry.second);
+  }
+  return Status::Ok();
+}
+
+Status WorkloadController::begin_start(const std::string &attempt_id,
                                        const std::string& tenant) {
   std::lock_guard<std::mutex> lock(mutex_);
   auto location = find_attempt(attempt_id);

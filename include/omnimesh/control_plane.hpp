@@ -15,6 +15,9 @@ enum class RecordType : std::uint8_t {
   workload_cancelled = 4,
   reservation = 5,
   attempt_observed = 6,
+  // Records a task's final outcome after its reservation was released. Needed so
+  // compaction can preserve resolved tasks without re-reserving capacity.
+  task_resolved = 7,
 };
 
 struct RecoveryReport {
@@ -52,6 +55,17 @@ public:
                             std::uint64_t generation);
   Status record_observation(const Observation &observation);
   Status flush();
+
+  // Rewrite the journal from live authoritative state to reclaim space within
+  // its 16 MiB bound. `allocator` and `controller` must
+  // hold the state the caller last recovered or mutated; the caller must not
+  // mutate them concurrently, and no other writer may hold the journal.
+  //
+  // Only facts needed to reconstruct current state are retained: current node
+  // inventory, quotas and workloads, cancellations, full ordered attempt history
+  // and resolved task states. Superseded observations are dropped. The complete
+  // replacement must still fit within the journal limits.
+  Status compact(const Allocator &allocator, const WorkloadController &controller);
 
   JournalStats stats() const;
   std::vector<Diagnostic> diagnostics() const;

@@ -197,4 +197,16 @@ AllocatorSnapshot Allocator::snapshot() const {
   return accounts_;
 }
 
+Status Allocator::active_allocations(std::vector<Allocation> &allocations) const {
+  std::lock_guard<std::mutex> lock(mutex_);
+  allocations.clear();
+  allocations.reserve(accounts_.tenants.size() * 2);
+  for (const auto &entry : allocations_) {
+    if (entry.second.active) {
+      allocations.push_back(entry.second);
+    }
+  }
+  return Status::Ok();
+}
+
 } // namespace omnimesh

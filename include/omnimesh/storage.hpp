@@ -18,8 +18,10 @@ struct JournalStats {
 // Single writer, versioned, bounded event journal. A short final frame/payload
 // is removed on open. Complete checksum/sequence errors fail closed and
 // preserve the file. Fsync precedes acknowledgment; no cryptographic integrity
-// is implied. Callers must stop mutation after any I/O error. No compaction is
-// implemented.
+// is implied. Callers must stop mutation after any I/O error. Compaction
+// rewrites the journal from a caller-supplied complete fact set; it is
+// crash-atomic and retains exclusive writer ownership through replacement.
+// Methods on one instance require external serialization.
 class Journal {
 public:
   Journal() = default;
@@ -35,9 +37,22 @@ public:
   JournalStats stats() const;
   const std::vector<Diagnostic> &diagnostics() const;
 
+  // Rewrite this journal so it contains only `records`, atomically. The
+  // replacement is fully written and verified in a sibling temporary file before
+  // a single atomic rename swaps it in, so an interruption at any point leaves
+  // either the original or complete replacement authoritative. Sequence numbers
+  // restart at 1, so the replacement must carry every fact needed for recovery.
+  //
+  // Both inodes stay locked across rename; the installed handle is transferred
+  // without reopening. Callers must serialize their own state mutations while
+  // deriving the complete fact set. An I/O failure requires close and recovery.
+  Status compact(const std::vector<std::pair<std::uint8_t, std::string>> &records);
+
 private:
+  Status attach(int fd);
   Status scan(bool repair_tail);
   std::FILE *file_{nullptr};
+  std::string path_;
   std::uint64_t sequence_{0};
   std::uint64_t bytes_{0};
   bool faulted_{false};

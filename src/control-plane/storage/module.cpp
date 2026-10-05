@@ -1,10 +1,12 @@
 #include "omnimesh/storage.hpp"
 #include <cerrno>
 #include <cstring>
+#include <cstdlib>
 #include <fcntl.h>
 #include <sys/file.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#include <utility>
 
 namespace omnimesh {
 namespace {
@@ -14,6 +16,30 @@ constexpr std::size_t kFrameBytes = 24;
 Status io_error(const char *message) {
   return {StatusCode::internal,
           std::string(message) + ": " + std::strerror(errno)};
+}
+Status sync_directory(const std::string &path) {
+  const auto slash = path.rfind('/');
+  const auto parent = slash == std::string::npos ? "."
+                      : slash == 0               ? "/"
+                                                 : path.substr(0, slash);
+  const int directory =
+      ::open(parent.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+  if (directory < 0) {
+    return io_error("cannot open journal directory");
+  }
+  const int result = fsync(directory);
+  const auto status = result == 0 ? Status::Ok()
+                                  : io_error("cannot sync journal directory");
+  ::close(directory);
+  return status;
+}
+// Atomically replace `target` with `source`. rename(2) replaces the directory
+// entry in one step, so a concurrent open never observes a missing journal and
+// can never create an empty one over committed state.
+Status atomic_replace(const std::string &source, const std::string &target) {
+  return ::rename(source.c_str(), target.c_str()) == 0
+             ? Status::Ok()
+             : io_error("cannot replace journal");
 }
 void store(unsigned char *target, std::uint64_t value, unsigned size) {
   for (unsigned i = 0; i < size; ++i) {
@@ -62,11 +88,15 @@ Status Journal::open(const std::string &path) {
       path.find('\0') != std::string::npos) {
     return {StatusCode::invalid_argument, "invalid journal path"};
   }
+  path_ = path;
   const int fd =
       ::open(path.c_str(), O_CREAT | O_RDWR | O_NOFOLLOW | O_CLOEXEC, 0600);
   if (fd < 0) {
     return io_error("cannot open journal");
   }
+  return attach(fd);
+}
+Status Journal::attach(int fd) {
   struct stat info{};
   if (fstat(fd, &info) != 0 || !S_ISREG(info.st_mode) ||
       info.st_uid != getuid() || (info.st_mode & 0777) != 0600 ||
@@ -79,12 +109,28 @@ Status Journal::open(const std::string &path) {
     ::close(fd);
     return {StatusCode::conflict, "journal already has an owner"};
   }
+  // An opener can hold an old descriptor across another writer's rename and
+  // only acquire its lock after compaction releases the retired inode. Never
+  // initialize, repair or append through that detached descriptor.
+  struct stat current{};
+  if (lstat(path_.c_str(), &current) != 0 ||
+      current.st_dev != info.st_dev || current.st_ino != info.st_ino) {
+    ::close(fd);
+    return {StatusCode::conflict,
+            "journal changed while acquiring ownership; retry open"};
+  }
   file_ = fdopen(fd, "r+b");
   if (!file_) {
+    const auto status = io_error("cannot open journal stream");
     ::close(fd);
-    return io_error("cannot open journal stream");
+    return status;
   }
-  if (info.st_size == 0) {
+  auto status = Status::Ok();
+  // Refresh metadata after locking: a previous owner may have appended while
+  // this descriptor was waiting to acquire ownership.
+  if (fstat(fd, &info) != 0) {
+    status = io_error("cannot inspect locked journal");
+  } else if (info.st_size == 0) {
     unsigned char header[kHeaderBytes]{};
     std::memcpy(header, kMagic, 8);
     store(header + 8, kJournalVersion, 4);
@@ -93,23 +139,14 @@ Status Journal::open(const std::string &path) {
     } else {
       status = sync();
     }
-    if (status.ok()) {
-      const auto slash = path.rfind('/');
-      const auto parent = slash == std::string::npos ? "."
-                          : slash == 0               ? "/"
-                                                     : path.substr(0, slash);
-      const int directory =
-          ::open(parent.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
-      if (directory < 0 || fsync(directory) != 0) {
-        status = io_error("cannot sync journal directory");
-      }
-      if (directory >= 0) {
-        ::close(directory);
-      }
-    }
   }
   if (status.ok()) {
     status = scan(true);
+  }
+  if (status.ok()) {
+    // Also establishes directory durability when reopening after a failed
+    // post-rename sync; an existing file is not proof its name is durable.
+    status = sync_directory(path_);
   }
   if (!status.ok()) {
     std::fclose(file_);
@@ -211,7 +248,7 @@ Status Journal::append(std::uint8_t type, const std::string &payload) {
   if (sequence_ >= kMaxRecordsPerReplay ||
       bytes_ + kFrameBytes + payload.size() > kMaxJournalBytes) {
     return {StatusCode::resource_exhausted,
-            "journal capacity reached; compaction is unsupported"};
+            "journal capacity reached; compact a complete recovered state before retrying"};
   }
   unsigned char frame[kFrameBytes];
   store(frame, sequence_ + 1, 8);
@@ -299,6 +336,88 @@ Status Journal::close() {
   file_ = nullptr;
   return status.ok() && closed != 0 ? io_error("cannot close journal") : status;
 }
+Status Journal::compact(
+    const std::vector<std::pair<std::uint8_t, std::string>> &records) {
+  if (!file_ || faulted_) {
+    return {StatusCode::unavailable,
+            "journal is closed or has an unresolved I/O failure"};
+  }
+  if (records.size() > kMaxRecordsPerReplay) {
+    return {StatusCode::invalid_argument, "compaction record set is too large"};
+  }
+  std::uint64_t total = kHeaderBytes;
+  for (const auto &record : records) {
+    if (record.second.empty() || record.second.size() > kMaxRecordBytes) {
+      return {StatusCode::invalid_argument,
+              "compaction record payload size is out of bounds"};
+    }
+    total += kFrameBytes + record.second.size();
+  }
+  if (total > kMaxJournalBytes) {
+    return {StatusCode::invalid_argument,
+            "compacted journal would still exceed the size limit"};
+  }
+  // Refuse to erase corruption or an unresolved torn write with a snapshot.
+  auto status = sync();
+  if (status.ok()) {
+    status = scan(false);
+  }
+  if (!status.ok()) {
+    faulted_ = true;
+    return status;
+  }
+  // Unique, exclusive temporary creation avoids truncating a stale temporary or
+  // replacing a file currently owned by someone else. Both inodes remain locked.
+  auto temporary = path_ + ".compact-XXXXXX";
+  const int fd = mkostemp(temporary.data(), O_CLOEXEC);
+  if (fd < 0) {
+    return io_error("cannot create compacted journal");
+  }
+  struct Cleanup {
+    const std::string &path;
+    ~Cleanup() { ::unlink(path.c_str()); }
+  } cleanup{temporary};
+  Journal replacement;
+  replacement.path_ = temporary;
+  status = replacement.attach(fd);
+  for (const auto &record : records) {
+    if (status.ok()) {
+      status = replacement.append(record.first, record.second);
+    }
+  }
+  if (status.ok()) {
+    // Strict verification never repairs a torn replacement into a valid prefix.
+    status = replacement.scan(false);
+  }
+  if (status.ok() && (replacement.sequence_ != records.size() ||
+                      replacement.bytes_ != total)) {
+    status = corrupt();
+  }
+  if (!status.ok()) {
+    return status;
+  }
+  status = atomic_replace(temporary, path_);
+  if (!status.ok()) {
+    return status;
+  }
+  // Transfer the already locked stream, never close/reopen the installed path.
+  // replacement now owns the retired inode until directory durability is known.
+  std::swap(file_, replacement.file_);
+  std::swap(sequence_, replacement.sequence_);
+  std::swap(bytes_, replacement.bytes_);
+  status = sync_directory(path_);
+  const auto retired_status = replacement.close();
+  if (status.ok()) {
+    status = retired_status;
+  }
+  if (!status.ok()) {
+    // Rename succeeded but durability is uncertain. Keep the installed lock and
+    // refuse further operations until the caller closes and recovers.
+    faulted_ = true;
+  }
+  return status;
+}
+
 JournalStats Journal::stats() const { return {sequence_, bytes_, sequence_}; }
 const std::vector<Diagnostic> &Journal::diagnostics() const {
   return diagnostics_;

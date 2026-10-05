@@ -227,6 +227,133 @@ void invalid_events_fail_closed() {
              .status); // No skipped ownership fact.
   CHECK(partial.snapshot().tenants.at("local").active_allocations == 0);
 }
+void compaction_is_crash_atomic() {
+  Sandbox sandbox;
+  Journal journal;
+  CHECK(journal.open(sandbox.journal()).ok());
+  CHECK(journal.append(1, "keep-me").ok());
+  CHECK(journal.append(2, "keep-me-too").ok());
+  const auto grown = journal.stats().bytes;
+
+  // A set that would still exceed the 16 MiB limit is refused up front.
+  std::vector<std::pair<std::uint8_t, std::string>> oversized;
+  while (20 + oversized.size() * (24 + kMaxRecordBytes) <= kMaxJournalBytes) {
+    oversized.emplace_back(1, std::string(kMaxRecordBytes, 'x'));
+  }
+  oversized.emplace_back(1, "one-too-many");
+  CHECK(oversized.size() > 256);
+  CHECK(journal.compact(oversized).code == StatusCode::invalid_argument);
+  // The refusal happened before any replacement was written.
+  CHECK(!std::filesystem::exists(sandbox.journal() + ".compact"));
+  CHECK(journal.stats().bytes == grown);
+  CHECK(journal.compact({{7, "compacted-a"}, {7, "compacted-b"}}).ok());
+  CHECK(journal.stats().sequence == 2);
+  // The lock is still held after compaction, so a competitor cannot take over.
+  Journal competitor;
+  CHECK(competitor.open(sandbox.journal()).code == StatusCode::conflict);
+
+  std::vector<std::string> applied;
+  CHECK(journal
+            .replay([&](std::uint8_t, const std::string &payload) {
+              applied.push_back(payload);
+            })
+            .ok());
+  CHECK(applied == (std::vector<std::string>{"compacted-a", "compacted-b"}));
+  // Appends continue from the compacted sequence.
+  CHECK(journal.append(8, "after").ok());
+  CHECK(journal.close().ok());
+
+  Journal reopened;
+  CHECK(reopened.open(sandbox.journal()).ok());
+  applied.clear();
+  CHECK(reopened
+            .replay([&](std::uint8_t, const std::string &payload) {
+              applied.push_back(payload);
+            })
+            .ok());
+  CHECK(applied == (std::vector<std::string>{"compacted-a", "compacted-b", "after"}));
+  // No temporary file may survive a successful compaction.
+  CHECK(!std::filesystem::exists(sandbox.journal() + ".compact"));
+}
+void compaction_preserves_recovered_state() {
+  Sandbox sandbox;
+  DurableControlPlane plane;
+  CHECK(plane.open(sandbox.directory).ok());
+  CHECK(plane.record_node(test::node()).ok());
+  CHECK(plane.record_quota("local", {{4000, 4096}, 4}).ok());
+  CHECK(plane.record_workload(test::workload()).ok());
+  CHECK(plane.record_reservation("local/hello/g1/r0", "node-a", 1, 1).ok());
+
+  Allocator allocator;
+  WorkloadController controller(allocator);
+  CHECK(plane.recover(allocator, controller).status);
+  // Fill the journal with history that compaction must discard, then compact.
+  for (int i = 0; i < 8; ++i) {
+    CHECK(plane.record_cancellation("local/absent-" + std::to_string(i)).ok());
+  }
+  const auto before = plane.stats();
+  CHECK(before.records > 10);
+  CHECK(plane.compact(allocator, controller).ok());
+  CHECK(plane.stats().records < before.records);
+  CHECK(plane.stats().sequence < before.records);
+
+  // Recovery from the compacted journal reproduces the same accounting.
+  CHECK(plane.close().ok());
+  Allocator fresh_allocator;
+  WorkloadController fresh(fresh_allocator);
+  DurableControlPlane reader;
+  CHECK(reader.open(sandbox.directory).ok());
+  const auto report = reader.recover(fresh_allocator, fresh);
+  CHECK(report.status);
+  CHECK(report.records_skipped == 0);
+  CHECK(fresh_allocator.snapshot().nodes.at("node-a").used ==
+        (Resources{1000, 1024}));
+  WorkloadRecord record;
+  CHECK(fresh.inspect("local/hello", "local", record).ok());
+  CHECK(record.tasks.size() == 1);
+  CHECK(record.tasks[0].attempts.size() == 1);
+  // A compacted unfinished attempt is Unknown: no new start may be inferred.
+  CHECK(record.tasks[0].attempts[0].state == AttemptState::unknown);
+  CHECK(record.tasks[0].state == TaskState::unknown);
+  // Recovery deliberately refuses to start an Unknown attempt: absence of a
+  // recorded start does not prove no worker is running.
+  CHECK(fresh.begin_start(record.tasks[0].attempts[0].id, "local").code ==
+        StatusCode::conflict);
+
+  // Once the attempt finishes, both its reservation and its record are gone.
+  Observation done{record.tasks[0].attempts[0].id, "node-a", 1, 2,
+                   AttemptState::succeeded, false, 0};
+  CHECK(fresh.observe(done).ok());
+  CHECK(fresh_allocator.snapshot().nodes.at("node-a").used == Resources{});
+  CHECK(reader.close().ok());
+  // Compact the freshly observed state through its own journal handle.
+  CHECK(reader.open(sandbox.directory).ok());
+  CHECK(reader.compact(fresh_allocator, fresh).ok());
+  CHECK(reader.close().ok());
+
+  Allocator after;
+  WorkloadController after_controller(after);
+  DurableControlPlane final_reader;
+  CHECK(final_reader.open(sandbox.directory).ok());
+  const auto last = final_reader.recover(after, after_controller);
+  CHECK(last.status);
+  CHECK(last.records_skipped == 0);
+  WorkloadRecord finished;
+  CHECK(after_controller.inspect("local/hello", "local", finished).ok());
+  CHECK(finished.tasks[0].state == TaskState::succeeded);
+  CHECK(finished.tasks[0].attempts.size() == 1);
+  CHECK(after.snapshot().nodes.at("node-a").used == Resources{});
+
+  // The terminal task is resolved and a terminal attempt is not re-adopted.
+  CHECK(final_reader.close().ok());
+  DurableControlPlane again;
+  Allocator again_allocator;
+  WorkloadController again_controller(again_allocator);
+  CHECK(again.open(sandbox.directory).ok());
+  CHECK(again.recover(again_allocator, again_controller).status);
+  CHECK(again_controller.inspect("local/hello", "local", finished).ok());
+  CHECK(finished.tasks[0].state == TaskState::succeeded);
+}
 } // namespace
 int main() {
   return test::run([] {
@@ -235,5 +362,7 @@ int main() {
     corruption_and_ownership();
     durable_recovery();
     invalid_events_fail_closed();
+    compaction_is_crash_atomic();
+    compaction_preserves_recovered_state();
   });
 }

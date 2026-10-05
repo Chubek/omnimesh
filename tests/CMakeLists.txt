@@ -6,6 +6,14 @@ foreach(suite manifest allocator scheduler orchestrator storage artifacts images
   set_tests_properties(${suite} PROPERTIES TIMEOUT 30)
 endforeach()
 
+add_executable(omnimesh-test-journal-faults unit/journal_faults.cpp)
+target_link_libraries(omnimesh-test-journal-faults PRIVATE omnimesh-core)
+target_compile_options(omnimesh-test-journal-faults PRIVATE -Wall -Wextra -Wpedantic)
+target_link_options(omnimesh-test-journal-faults PRIVATE
+  -Wl,--wrap=rename -Wl,--wrap=flock -Wl,--wrap=fsync)
+add_test(NAME journal-faults COMMAND omnimesh-test-journal-faults)
+set_tests_properties(journal-faults PROPERTIES TIMEOUT 30)
+
 add_subdirectory(integration)
 
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND OMNIMESH_HAVE_SPAWN_CLOSEFROM)

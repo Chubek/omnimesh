@@ -109,6 +109,17 @@ Json decode(std::uint8_t type, const std::string &payload) {
             (exit == 0 && !value["retryable"].get<bool>()));
     break;
   }
+  case RecordType::task_resolved: {
+    fields(value, {"taskId", "tenant", "state"});
+    const auto task = text(value["taskId"]), tenant = text(value["tenant"]);
+    require(task.compare(0, tenant.size() + 1, tenant + "/") == 0);
+    const auto state = number(
+        value["state"], static_cast<std::uint32_t>(TaskState::cancelled));
+    require(state == static_cast<std::uint32_t>(TaskState::succeeded) ||
+            state == static_cast<std::uint32_t>(TaskState::failed) ||
+            state == static_cast<std::uint32_t>(TaskState::cancelled));
+    break;
+  }
   default:
     throw RecordError("unsupported durable record type");
   }
@@ -182,6 +193,11 @@ RecoveryReport DurableControlPlane::recover(Allocator &allocator,
             static_cast<std::uint32_t>(number(value["attemptNumber"])),
             number(value["generation"]), value["tenant"]));
         ++report.reservations_recovered;
+        break;
+      case RecordType::task_resolved:
+        accepted(controller.adopt_resolution(
+            value["taskId"], static_cast<TaskState>(number(value["state"])),
+            value["tenant"]));
         break;
       case RecordType::attempt_observed: {
         auto state = static_cast<AttemptState>(number(value["state"]));
@@ -291,9 +307,131 @@ Status DurableControlPlane::append(std::uint8_t type,
   std::lock_guard<std::mutex> lock(mutex_);
   return journal_.append(type, payload);
 }
-Status DurableControlPlane::flush() {
+Status DurableControlPlane::compact(const Allocator &allocator,
+                                    const WorkloadController &controller) {
+  std::vector<WorkloadRecord> workloads;
+  const auto status = controller.live_state(workloads);
+  if (!status.ok()) {
+    return status;
+  }
+  std::vector<Allocation> allocations;
+  const auto reserved = allocator.active_allocations(allocations);
+  if (!reserved.ok()) {
+    return reserved;
+  }
+  // Every active allocation must correspond to an unfinished attempt, otherwise
+  // compaction would silently drop committed capacity from recovery.
+  std::size_t unfinished = 0;
+  for (const auto &record : workloads) {
+    for (const auto &task : record.tasks) {
+      const auto resolved = task.state == TaskState::succeeded ||
+                            task.state == TaskState::failed ||
+                            task.state == TaskState::cancelled;
+      if (!resolved) {
+        continue;
+      }
+      // A resolved task must hold no capacity: its attempts are replayed and
+      // released, so a lingering allocation would mean accounting disagreement.
+      for (const auto &attempt : task.attempts) {
+        if (attempt.state != AttemptState::succeeded &&
+            attempt.state != AttemptState::failed &&
+            attempt.state != AttemptState::cancelled) {
+          return {StatusCode::conflict,
+                  "refusing to compact: a resolved task still has an "
+                  "unfinished attempt"};
+        }
+      }
+    }
+    for (const auto &task : record.tasks) {
+      const auto resolved = task.state == TaskState::succeeded ||
+                            task.state == TaskState::failed ||
+                            task.state == TaskState::cancelled;
+      if (!resolved) {
+        for (const auto &attempt : task.attempts) {
+          if (attempt.state != AttemptState::succeeded &&
+              attempt.state != AttemptState::failed &&
+              attempt.state != AttemptState::cancelled) {
+            ++unfinished;
+          }
+        }
+      }
+    }
+  }
+  if (allocations.size() != unfinished) {
+    return {StatusCode::conflict,
+            "refusing to compact: allocation accounting and attempt history "
+            "disagree; compacting could drop committed capacity"};
+  }
+  // Order matters: quotas before workloads, workloads before reservations, and
+  // reservations before observations, because each record is applied in
+  // sequence during recovery.
+  std::vector<std::pair<std::uint8_t, std::string>> records;
+  const auto push = [&records](RecordType type, const Json &value) {
+    records.emplace_back(static_cast<std::uint8_t>(type), envelope(type, value));
+  };
+  const auto snapshot = allocator.snapshot();
+  for (const auto &entry : snapshot.tenants) {
+    push(RecordType::tenant_quota,
+         {{"tenant", entry.first},
+          {"cpuMillis", entry.second.quota.limit.cpu_millis},
+          {"memoryBytes", entry.second.quota.limit.memory_bytes},
+          {"maxAllocations", entry.second.quota.max_allocations}});
+  }
+  for (const auto &entry : snapshot.nodes) {
+    push(RecordType::node_inventory, Json::parse(encode_node(entry.second.node)));
+  }
+  for (const auto &record : workloads) {
+    push(RecordType::workload_desired, Json::parse(encode_workload(record.spec)));
+    if (record.cancel_requested) {
+      push(RecordType::workload_cancelled,
+           {{"workloadId", record.spec.tenant + "/" + record.spec.name},
+            {"tenant", record.spec.tenant}});
+    }
+  }
+  // Attempt ordering belongs to the controller, so reservation records come from
+  // its attempt history rather than from allocation identity strings.
+  // adopt_reservation restores an unfinished attempt as Unknown, which is the
+  // honest post-compaction state: a recorded liveness event cannot establish
+  // present liveness, so compaction must not imply a worker is running.
+  //
+  // Attempt history is preserved in order: reservation, then the attempt's final
+  // observation. Replay re-reserves transiently and the terminal observation
+  // releases it again, so accounting is unchanged and no attempt is lost. A
+  // terminal task_state follows, because adopt_reservation only accepts a task
+  // that is not already resolved.
+  for (const auto &record : workloads) {
+    for (const auto &task : record.tasks) {
+      for (const auto &attempt : task.attempts) {
+        push(RecordType::reservation,
+             {{"taskId", task.id},
+              {"nodeId", attempt.node_id},
+              {"attemptNumber", attempt.number},
+              {"generation", attempt.generation},
+              {"tenant", record.spec.tenant}});
+        if (attempt.state == AttemptState::succeeded ||
+            attempt.state == AttemptState::failed ||
+            attempt.state == AttemptState::cancelled) {
+          push(RecordType::attempt_observed,
+               {{"attemptId", attempt.id},
+                {"nodeId", attempt.node_id},
+                {"generation", attempt.generation},
+                {"sequence", attempt.observation_sequence},
+                {"state", static_cast<std::uint32_t>(attempt.state)},
+                {"retryable", attempt.retryable},
+                {"exitCode", attempt.exit_code}});
+        }
+      }
+      if (task.state == TaskState::succeeded || task.state == TaskState::failed ||
+          task.state == TaskState::cancelled) {
+        push(RecordType::task_resolved,
+             {{"taskId", task.id},
+              {"tenant", record.spec.tenant},
+              {"state", static_cast<std::uint32_t>(task.state)}});
+      }
+    }
+  }
   std::lock_guard<std::mutex> lock(mutex_);
-  return journal_.sync();
+  return journal_.compact(records);
 }
 JournalStats DurableControlPlane::stats() const {
   std::lock_guard<std::mutex> lock(mutex_);

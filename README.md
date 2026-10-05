@@ -1,10 +1,10 @@
 # OmniMesh
 
 OmniMesh is a distributed execution platform built around OCI-compatible
-container execution and image distribution. The seventh implementation
-regiment connects digest-pinned workload inputs from the local artifact spool
-to read-only worker mounts, with bounded staging and cancellation before launch.
-See [the regiment contract](docs/seventh-regiment.md).
+container execution and image distribution. The ninth implementation regiment
+hardens journal compaction with continuous writer ownership, strict replacement
+verification and fail-closed recovery after publication errors. See
+[the regiment contract](docs/ninth-regiment.md).
 
 ## Build and test
 
@@ -18,7 +18,7 @@ cmake --build build -j
 ctest --test-dir build --output-on-failure
 ```
 
-Test suites: `smoke`, `manifest`, `allocator`, `scheduler`, `orchestrator`, `storage`,
+Test suites: `smoke`, `manifest`, `allocator`, `scheduler`, `orchestrator`, `storage`, `journal-faults`,
 `process`, `execution`, `artifacts`, `images`, `cli`, and `agent-cli`. The optional `oci-runtime` test
 skips unless a real runtime and rootfs are explicitly configured. Journaled planning
 and execution are covered by cases in `execution`, `cli` and `agent-cli`; the spool
@@ -27,8 +27,10 @@ by `images` and `image` cases in `cli`. See
 [the durable-execution contract](docs/third-regiment.md),
 [the spool contract](docs/fourth-regiment.md) and
 [the image contract](docs/fifth-regiment.md) and
-[verified image execution](docs/sixth-regiment.md) and
-[workload artifact inputs](docs/seventh-regiment.md).
+[verified image execution](docs/sixth-regiment.md),
+[workload artifact inputs](docs/seventh-regiment.md) and
+[journal compaction](docs/eighth-regiment.md) and
+[compaction ownership and fault handling](docs/ninth-regiment.md).
 
 ## What works
 
@@ -44,6 +46,7 @@ reservation, and task/attempt reconciliation are implemented in
 | `omnimesh plan WORKLOAD.json --node NODE.json [...] [--quota CPU MEM MAX_ALLOC]` | Admission plus placement dry run. |
 | `omnimesh plan ... --journal-dir DIR` | Dry run that also records planning facts for later recovery. |
 | `omnimesh recover --journal-dir DIR` | Replay a journal into fresh memory and report the outcome. |
+| `omnimesh compact --journal-dir DIR` | Rewrite a journal from recovered state to reclaim space. |
 | `omnimesh artifact put FILE --spool-dir DIR --tenant TENANT` | Hash, verify and publish a content-addressed blob. |
 | `omnimesh artifact get DIGEST --spool-dir DIR --tenant TENANT --out FILE` | Re-verify and fetch a blob by digest. |
 | `omnimesh artifact list --spool-dir DIR` | List spool contents, usage and recovery notes. |
@@ -61,6 +64,23 @@ omnimesh plan manifests/example-workload.json --node manifests/example-node.json
 
 `plan` reports per-task state and, when a task cannot be placed, the reasons
 each node was rejected. It reports `dryRun: true` and never starts work.
+
+A journal file is bounded at 16 MiB. When it approaches that bound, run
+`omnimesh compact --journal-dir DIR` while no other writer holds the journal. It
+recovers, rewrites the journal from live state, and reports the reclaimed
+bytes. It refuses to compact a journal that fails recovery, and it does not
+invent running work: unfinished attempts are recorded as `Unknown` and require
+fresh observations. Compaction holds exclusive writer ownership throughout
+replacement; contending commands return a conflict. The complete state must
+still fit within the journal's limits. See
+[the compaction contract](docs/eighth-regiment.md) and
+[failure recovery and temporary-file cleanup](docs/ninth-regiment.md).
+
+A journaled `plan` recovers existing accounting before planning, so repeated
+runs accumulate against committed capacity instead of each reserving from an
+empty allocator. Once a node is full, later plans report `Queued` with the
+rejection reasons and exit `3`; they do not journal reservations the node cannot
+satisfy.
 
 Manifests are **strict JSON**, which is also valid YAML 1.2. General YAML
 syntax is rejected rather than partially understood, so
@@ -151,7 +171,8 @@ with no loader.
 `WorkloadController` and `Allocator` remain process-local. The CLIs record
 journaled facts before acting on them and `omnimesh recover` replays a journal
 into fresh memory, but live mutations are not transactionally wrapped inside
-their locks. Local execution
+their locks. `omnimesh compact` reclaims journal space while retaining exclusive
+ownership of the journal. Local execution
 uses a host-user lock and conservative recovery barrier. There are no distributed
 leases or fencing tokens. See [implementation status](docs/status.md).
 
