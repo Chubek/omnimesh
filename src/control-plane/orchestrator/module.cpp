@@ -216,7 +216,7 @@ Status WorkloadController::adopt_reservation(const std::string& task_id,
                                             std::uint32_t attempt_number,
                                             std::uint64_t generation,
                                             const std::string& tenant) {
-  if (attempt_number == 0 || attempt_number > kMaxReplicas ||
+  if (attempt_number == 0 || attempt_number > 16 ||
       generation == 0 || node_id.empty() || node_id.size() > 256) {
     return {StatusCode::invalid_argument, "invalid recovered reservation"};
   }
@@ -244,22 +244,28 @@ Status WorkloadController::adopt_reservation(const std::string& task_id,
   if (task->cancel_requested || terminal(task->state)) {
     return {StatusCode::conflict, "task is already resolved and cannot adopt an attempt"};
   }
+  if (attempt_number != task->attempts.size() + 1 ||
+      attempt_number > workload->spec.retry.max_attempts ||
+      (!task->attempts.empty() && !terminal(task->attempts.back().state))) {
+    return {StatusCode::conflict, "recovered attempts violate retry order or budget"};
+  }
   const auto requirements = requirements_for(workload->spec);
   ReservationRequest request{workload->spec.tenant + "/" + workload->spec.name,
                              task_id, attempt_id, generation, node_id, requirements};
-  Allocation allocation;
-  const auto status = allocator_.reserve(request, allocation);
-  if (!status.ok()) {
-    return status;
-  }
   AttemptRecord attempt;
   attempt.id = attempt_id;
   attempt.number = attempt_number;
   attempt.generation = generation;
   attempt.node_id = node_id;
-  attempt.allocation_id = allocation.id;
-  task->attempts.push_back(attempt);
-  task->state = TaskState::allocated;
+  attempt.allocation_id = "alloc/" + attempt_id;
+  attempt.state = AttemptState::unknown;
+  task->attempts.push_back(std::move(attempt));
+  Allocation allocation;
+  Status status;
+  try { status = allocator_.reserve(request, allocation); }
+  catch (...) { task->attempts.pop_back(); throw; }
+  if (!status.ok()) { task->attempts.pop_back(); return status; }
+  task->state = TaskState::unknown;
   return Status::Ok();
 }
 

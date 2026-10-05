@@ -8,7 +8,7 @@ endforeach()
 
 add_subdirectory(integration)
 
-if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND OMNIMESH_HAVE_SPAWN_CLOSEFROM)
   add_executable(omnimesh-fake-runtime fixtures/fake_runtime.cpp)
   target_link_libraries(omnimesh-fake-runtime PRIVATE omnimesh-json)
   target_compile_options(omnimesh-fake-runtime PRIVATE -Wall -Wextra -Wpedantic)

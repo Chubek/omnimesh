@@ -1,238 +1,306 @@
 #include "omnimesh/control_plane.hpp"
-#include "omnimesh/manifest.hpp"
-
-#include <nlohmann/json.hpp>
-
 #include <cerrno>
+#include <nlohmann/json.hpp>
+#include <set>
 #include <sys/stat.h>
+#include <unistd.h>
 
 namespace omnimesh {
 namespace {
-
 using Json = nlohmann::json;
-
-constexpr char kJournalFile[] = "control-plane.journal";
-
-Status bad_payload() {
-  return {StatusCode::invalid_argument, "durable record payload is malformed"};
+struct RecordError : std::runtime_error {
+  using std::runtime_error::runtime_error;
+};
+void require(bool condition) {
+  if (!condition) {
+    throw RecordError("invalid durable record");
+  }
 }
-
+void fields(const Json &value, std::initializer_list<const char *> keys) {
+  require(value.is_object() && value.size() == keys.size());
+  for (const auto *key : keys) {
+    require(value.contains(key));
+  }
+}
+std::string text(const Json &value) {
+  require(value.is_string());
+  const auto result = value.get<std::string>();
+  require(!result.empty() && result.size() <= 256 &&
+          result.find('\0') == std::string::npos);
+  return result;
+}
+std::uint64_t number(const Json &value, std::uint64_t maximum = UINT64_MAX) {
+  require(value.is_number_unsigned());
+  const auto result = value.get<std::uint64_t>();
+  require(result <= maximum);
+  return result;
+}
+Json decode(std::uint8_t type, const std::string &payload) {
+  std::size_t events = 0;
+  std::vector<std::set<std::string>> keys;
+  const auto callback = [&](int depth, Json::parse_event_t event, Json &value) {
+    require(depth <= 32 && ++events <= 16384);
+    if (event == Json::parse_event_t::object_start) {
+      keys.emplace_back();
+    } else if (event == Json::parse_event_t::object_end) {
+      keys.pop_back();
+    } else if (event == Json::parse_event_t::key) {
+      require(keys.back().insert(value.get<std::string>()).second);
+    }
+    return true;
+  };
+  const auto envelope = Json::parse(payload, callback);
+  fields(envelope, {"t", "v"});
+  require(number(envelope["t"], 255) == type);
+  const auto &value = envelope["v"];
+  switch (static_cast<RecordType>(type)) {
+  case RecordType::node_inventory:
+    require(parse_node(value.dump()).status.ok());
+    break;
+  case RecordType::workload_desired:
+    require(parse_workload(value.dump()).status.ok());
+    break;
+  case RecordType::tenant_quota: {
+    fields(value, {"tenant", "cpuMillis", "memoryBytes", "maxAllocations"});
+    PlacementRequirements requirements;
+    requirements.tenant = text(value["tenant"]);
+    requirements.resources = {number(value["cpuMillis"]),
+                              number(value["memoryBytes"])};
+    require(validate_requirements(requirements).ok());
+    require(number(value["maxAllocations"], kMaxAllocations) > 0);
+    break;
+  }
+  case RecordType::workload_cancelled: {
+    fields(value, {"workloadId", "tenant"});
+    const auto id = text(value["workloadId"]), tenant = text(value["tenant"]);
+    const auto slash = id.find('/');
+    require(slash != std::string::npos && id.substr(0, slash) == tenant &&
+            id.find('/', slash + 1) == std::string::npos);
+    auto workload = Workload{};
+    workload.name = id.substr(slash + 1);
+    workload.tenant = tenant;
+    workload.image = "sha256:" + std::string(64, 'a');
+    workload.command = {"/validate"};
+    require(validate_workload(workload).empty());
+    break;
+  }
+  case RecordType::reservation: {
+    fields(value,
+           {"taskId", "nodeId", "attemptNumber", "generation", "tenant"});
+    const auto task = text(value["taskId"]), tenant = text(value["tenant"]);
+    require(task.compare(0, tenant.size() + 1, tenant + "/") == 0);
+    text(value["nodeId"]);
+    require(number(value["attemptNumber"], 16) > 0 &&
+            number(value["generation"]) > 0);
+    break;
+  }
+  case RecordType::attempt_observed: {
+    fields(value, {"attemptId", "nodeId", "generation", "sequence", "state",
+                   "retryable", "exitCode"});
+    text(value["attemptId"]);
+    text(value["nodeId"]);
+    require(number(value["generation"]) > 0 && number(value["sequence"]) > 0);
+    const auto state = number(
+        value["state"], static_cast<std::uint32_t>(AttemptState::cancelled));
+    require(state >= static_cast<std::uint32_t>(AttemptState::starting) &&
+            value["retryable"].is_boolean());
+    const auto exit = number(value["exitCode"], 255);
+    require(state == static_cast<std::uint32_t>(AttemptState::failed) ||
+            (exit == 0 && !value["retryable"].get<bool>()));
+    break;
+  }
+  default:
+    throw RecordError("unsupported durable record type");
+  }
+  return value;
+}
+std::string envelope(RecordType type, const Json &value) {
+  return Json({{"t", static_cast<std::uint32_t>(type)}, {"v", value}}).dump();
+}
+void accepted(const Status &status) {
+  if (!status.ok()) {
+    throw RecordError("durable record conflicts with recovered state");
+  }
+}
 } // namespace
-
-Status DurableControlPlane::open(const std::string& directory) {
-  if (directory.empty() || directory.size() > 4096 || directory.find('\0') != std::string::npos) {
-    return {StatusCode::invalid_argument, "state directory path is invalid"};
+Status DurableControlPlane::open(const std::string &directory) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  if (directory.empty() || directory.size() > 4096 ||
+      directory.find('\0') != std::string::npos) {
+    return {StatusCode::invalid_argument, "invalid state directory"};
   }
   if (::mkdir(directory.c_str(), 0700) != 0 && errno != EEXIST) {
-    return {StatusCode::unavailable, "cannot create state directory: " + directory};
+    return {StatusCode::unavailable, "cannot create private state directory"};
+  }
+  struct stat info{};
+  if (lstat(directory.c_str(), &info) != 0 || !S_ISDIR(info.st_mode) ||
+      info.st_uid != getuid() || (info.st_mode & 0777) != 0700) {
+    return {StatusCode::permission_denied,
+            "state directory must be private and owned by this user"};
   }
   directory_ = directory;
-  return journal_.open(directory + "/" + kJournalFile);
+  return journal_.open(directory + "/control-plane.journal");
 }
-
-RecoveryReport DurableControlPlane::recover(Allocator& allocator,
-                                           WorkloadController& controller) {
+Status DurableControlPlane::close() {
+  std::lock_guard<std::mutex> lock(mutex_);
+  return journal_.close();
+}
+RecoveryReport DurableControlPlane::recover(Allocator &allocator,
+                                            WorkloadController &controller) {
+  std::lock_guard<std::mutex> lock(mutex_);
   RecoveryReport report;
-  const auto apply = [&](std::uint8_t raw_type, const std::string& payload) {
-    const Json record = Json::parse(payload, nullptr, /*allow_exceptions=*/false);
-    if (record.is_discarded() || !record.is_object() || !record.contains("t") ||
-        !record.contains("v")) {
-      ++report.records_skipped;
-      report.diagnostics.push_back({"$journal", "skipped an unparseable record"});
-      return;
-    }
-    const auto type = record["t"].get<std::uint32_t>();
-    const auto& value = record["v"];
-    if (type == RecordType::node_inventory) {
-      const auto node = parse_node(value.dump());
-      if (!node.status.ok() || !allocator.upsert_node(node.value).ok()) {
-        ++report.records_skipped;
-        report.diagnostics.push_back(
-            {"$journal", "rejected a durable node record that no longer validates"});
+  // Validate all payloads before mutating the caller's state. A later ordering
+  // conflict still fails recovery; callers must discard that partial state.
+  auto status =
+      journal_.replay([](std::uint8_t type, const std::string &payload) {
+        decode(type, payload);
+      });
+  if (status.ok()) {
+    status = journal_.replay([&](std::uint8_t raw, const std::string &payload) {
+      const auto value = decode(raw, payload);
+      switch (static_cast<RecordType>(raw)) {
+      case RecordType::node_inventory:
+        accepted(allocator.upsert_node(parse_node(value.dump()).value));
+        break;
+      case RecordType::tenant_quota:
+        accepted(allocator.set_quota(
+            value["tenant"],
+            {{number(value["cpuMillis"]), number(value["memoryBytes"])},
+             static_cast<std::size_t>(number(value["maxAllocations"]))}));
+        break;
+      case RecordType::workload_desired: {
+        const auto workload = parse_workload(value.dump()).value;
+        accepted(controller.submit(workload, workload.tenant));
+        break;
       }
-      return;
-    }
-    if (type == RecordType::tenant_quota) {
-      const auto tenant = value.at("tenant").get<std::string>();
-      TenantQuota quota{{value.at("cpuMillis").get<std::uint64_t>(),
-                         value.at("memoryBytes").get<std::uint64_t>()},
-                        value.at("maxAllocations").get<std::size_t>()};
-      if (!allocator.set_quota(tenant, quota).ok()) {
-        ++report.records_skipped;
-        report.diagnostics.push_back(
-            {"$journal", "rejected a durable tenant quota record"});
-      }
-      return;
-    }
-    if (type == RecordType::workload_desired) {
-      const auto workload = parse_workload(value.dump());
-      if (!workload.status.ok() || !controller.submit(workload.value, workload.value.tenant).ok()) {
-        ++report.records_skipped;
-        report.diagnostics.push_back(
-            {"$journal", "rejected a durable workload record that no longer validates"});
-      }
-      return;
-    }
-    if (type == RecordType::workload_cancelled) {
-      controller.cancel(value.at("workloadId").get<std::string>(),
-                        value.at("tenant").get<std::string>());
-      return;
-    }
-    if (type == RecordType::reservation) {
-      const auto status = controller.adopt_reservation(
-          value.at("taskId").get<std::string>(), value.at("nodeId").get<std::string>(),
-          value.at("attemptNumber").get<std::uint32_t>(),
-          value.at("generation").get<std::uint64_t>(), value.at("tenant").get<std::string>());
-      if (status.ok()) {
+      case RecordType::workload_cancelled:
+        accepted(controller.cancel(value["workloadId"], value["tenant"]));
+        break;
+      case RecordType::reservation:
+        accepted(controller.adopt_reservation(
+            value["taskId"], value["nodeId"],
+            static_cast<std::uint32_t>(number(value["attemptNumber"])),
+            number(value["generation"]), value["tenant"]));
         ++report.reservations_recovered;
-      } else if (status.code == StatusCode::conflict ||
-                 status.code == StatusCode::not_found) {
-        // Already applied, or the workload no longer exists. Neither is
-        // corruption, so replay continues without re-emitting capacity.
-        ++report.records_skipped;
-      } else {
-        ++report.records_skipped;
-        report.diagnostics.push_back({"$journal", "could not re-adopt reservation: " +
-                                                      status.message});
+        break;
+      case RecordType::attempt_observed: {
+        auto state = static_cast<AttemptState>(number(value["state"]));
+        // A historic liveness observation cannot establish present liveness.
+        if (state == AttemptState::starting || state == AttemptState::running ||
+            state == AttemptState::unknown) {
+          state = AttemptState::unknown;
+        }
+        Observation observation{text(value["attemptId"]),
+                                text(value["nodeId"]),
+                                number(value["generation"]),
+                                number(value["sequence"]),
+                                state,
+                                value["retryable"].get<bool>(),
+                                static_cast<int>(number(value["exitCode"]))};
+        const auto first = observation.attempt_id.find('/'),
+                   second = observation.attempt_id.find('/', first + 1);
+        require(first != std::string::npos && second != std::string::npos);
+        WorkloadRecord workload;
+        accepted(controller.inspect(observation.attempt_id.substr(0, second),
+                                    observation.attempt_id.substr(0, first),
+                                    workload));
+        bool already_applied = false;
+        for (const auto &task : workload.tasks) {
+          for (const auto &attempt : task.attempts) {
+            if (attempt.id == observation.attempt_id &&
+                attempt.observation_sequence > observation.sequence) {
+              already_applied = true;
+            }
+          }
+        }
+        if (already_applied) {
+          ++report.records_skipped;
+        } else {
+          accepted(controller.observe(observation));
+          ++report.observations_recovered;
+        }
+        break;
       }
-      return;
-    }
-    if (type == RecordType::attempt_observed) {
-      const auto sequence = value.at("sequence").get<std::uint64_t>();
-      Observation observation{value.at("attemptId").get<std::string>(),
-                              value.at("nodeId").get<std::string>(),
-                              value.at("generation").get<std::uint64_t>(), sequence,
-                              AttemptState::unknown, false, 0};
-      const auto state = value.at("state").get<std::uint32_t>();
-      if (state > static_cast<std::uint32_t>(AttemptState::cancelled)) {
-        ++report.records_skipped;
-        report.diagnostics.push_back({"$journal", "durable observation has an unknown state"});
-        return;
       }
-      observation.state = static_cast<AttemptState>(state);
-      observation.retryable = value.at("retryable").get<bool>();
-      observation.exit_code = value.at("exitCode").get<int>();
-      const auto status = controller.observe(observation, MonotonicClock::now());
-      if (status.ok() || status.code == StatusCode::conflict ||
-          status.code == StatusCode::not_found) {
-        ++report.observations_recovered;
-      } else {
-        ++report.records_skipped;
-        report.diagnostics.push_back(
-            {"$journal", "rejected a durable observation: " + status.message});
-      }
-      return;
-    }
-    ++report.records_skipped;
-    report.diagnostics.push_back({"$journal", "skipped a record of unknown type"});
-  };
-
-  const auto status = journal_.replay(apply);
-  report.diagnostics.insert(report.diagnostics.end(), journal_.diagnostics().begin(),
-                            journal_.diagnostics().end());
+      ++report.records_applied;
+    });
+  }
+  report.diagnostics = journal_.diagnostics();
+  if (!status.ok()) {
+    report.diagnostics.push_back({"$journal", status.message});
+  }
   report.status = status.ok();
-  report.records_applied = journal_.stats().records;
   return report;
 }
-
-Status DurableControlPlane::record_node(const Node& node) {
-  const auto diagnostics = validate_node(node);
-  if (!diagnostics.empty()) {
-    return {StatusCode::invalid_argument,
-            diagnostics.front().path + ": " + diagnostics.front().message};
-  }
-  return append(static_cast<std::uint8_t>(RecordType::node_inventory), encode_node(node));
+Status DurableControlPlane::record_node(const Node &node) {
+  return append(
+      static_cast<std::uint8_t>(RecordType::node_inventory),
+      envelope(RecordType::node_inventory, Json::parse(encode_node(node))));
 }
-
-Status DurableControlPlane::record_quota(const std::string& tenant,
-                                         const TenantQuota& quota) {
-  if (tenant.empty() || tenant.size() > 63) {
-    return {StatusCode::invalid_argument, "tenant identity is invalid"};
-  }
-  if (quota.limit.cpu_millis == 0 || quota.limit.memory_bytes == 0 ||
-      quota.max_allocations == 0 || quota.max_allocations > kMaxAllocations) {
-    return {StatusCode::invalid_argument, "quota must be positive and bounded"};
-  }
-  const Json payload{{"t", static_cast<std::uint32_t>(RecordType::tenant_quota)},
-                     {"v", {{"tenant", tenant},
-                            {"cpuMillis", quota.limit.cpu_millis},
-                            {"memoryBytes", quota.limit.memory_bytes},
-                            {"maxAllocations", quota.max_allocations}}}};
-  return append(static_cast<std::uint8_t>(RecordType::tenant_quota), payload.dump());
+Status DurableControlPlane::record_quota(const std::string &tenant,
+                                         const TenantQuota &quota) {
+  return append(static_cast<std::uint8_t>(RecordType::tenant_quota),
+                envelope(RecordType::tenant_quota,
+                         {{"tenant", tenant},
+                          {"cpuMillis", quota.limit.cpu_millis},
+                          {"memoryBytes", quota.limit.memory_bytes},
+                          {"maxAllocations", quota.max_allocations}}));
 }
-
-Status DurableControlPlane::record_workload(const Workload& workload) {
-  const auto diagnostics = validate_workload(workload);
-  if (!diagnostics.empty()) {
-    return {StatusCode::invalid_argument,
-            diagnostics.front().path + ": " + diagnostics.front().message};
-  }
+Status DurableControlPlane::record_workload(const Workload &workload) {
   return append(static_cast<std::uint8_t>(RecordType::workload_desired),
-                encode_workload(workload));
+                envelope(RecordType::workload_desired,
+                         Json::parse(encode_workload(workload))));
 }
-
-Status DurableControlPlane::record_cancellation(const std::string& workload_id) {
-  if (workload_id.empty() || workload_id.size() > 256) {
-    return {StatusCode::invalid_argument, "workload identity is invalid"};
-  }
-  const auto slash = workload_id.find('/');
-  const auto tenant = slash == std::string::npos ? std::string() : workload_id.substr(0, slash);
-  const Json payload{{"t", static_cast<std::uint32_t>(RecordType::workload_cancelled)},
-                     {"v", {{"workloadId", workload_id}, {"tenant", tenant}}}};
-  return append(static_cast<std::uint8_t>(RecordType::workload_cancelled), payload.dump());
+Status DurableControlPlane::record_cancellation(const std::string &id) {
+  return append(
+      static_cast<std::uint8_t>(RecordType::workload_cancelled),
+      envelope(RecordType::workload_cancelled,
+               {{"workloadId", id}, {"tenant", id.substr(0, id.find('/'))}}));
 }
-
-Status DurableControlPlane::record_reservation(const std::string& task_id,
-                                               const std::string& node_id,
-                                               std::uint32_t attempt_number,
+Status DurableControlPlane::record_reservation(const std::string &task,
+                                               const std::string &node,
+                                               std::uint32_t attempt,
                                                std::uint64_t generation) {
-  if (task_id.empty() || task_id.size() > 256 || node_id.empty() || node_id.size() > 256 ||
-      attempt_number == 0 || generation == 0) {
-    return {StatusCode::invalid_argument, "reservation record fields are invalid"};
-  }
-  const auto tenant = task_id.substr(0, task_id.find('/'));
-  const Json payload{{"t", static_cast<std::uint32_t>(RecordType::reservation)},
-                     {"v", {{"taskId", task_id},
-                            {"nodeId", node_id},
-                            {"attemptNumber", attempt_number},
-                            {"generation", generation},
-                            {"tenant", tenant}}}};
-  return append(static_cast<std::uint8_t>(RecordType::reservation), payload.dump());
+  return append(static_cast<std::uint8_t>(RecordType::reservation),
+                envelope(RecordType::reservation,
+                         {{"taskId", task},
+                          {"nodeId", node},
+                          {"attemptNumber", attempt},
+                          {"generation", generation},
+                          {"tenant", task.substr(0, task.find('/'))}}));
 }
-
-Status DurableControlPlane::record_observation(const Observation& observation) {
-  if (observation.attempt_id.empty() || observation.attempt_id.size() > 256 ||
-      observation.node_id.empty() || observation.node_id.size() > 256 ||
-      observation.sequence == 0 || observation.generation == 0 ||
-      observation.state == AttemptState::allocated) {
-    return {StatusCode::invalid_argument, "observation record fields are invalid"};
-  }
-  const Json payload{{"t", static_cast<std::uint32_t>(RecordType::attempt_observed)},
-                     {"v", {{"attemptId", observation.attempt_id},
-                            {"nodeId", observation.node_id},
-                            {"generation", observation.generation},
-                            {"sequence", observation.sequence},
-                            {"state", static_cast<std::uint32_t>(observation.state)},
-                            {"retryable", observation.retryable},
-                            {"exitCode", observation.exit_code}}}};
-  return append(static_cast<std::uint8_t>(RecordType::attempt_observed), payload.dump());
+Status DurableControlPlane::record_observation(const Observation &observation) {
+  return append(
+      static_cast<std::uint8_t>(RecordType::attempt_observed),
+      envelope(RecordType::attempt_observed,
+               {{"attemptId", observation.attempt_id},
+                {"nodeId", observation.node_id},
+                {"generation", observation.generation},
+                {"sequence", observation.sequence},
+                {"state", static_cast<std::uint32_t>(observation.state)},
+                {"retryable", observation.retryable},
+                {"exitCode", observation.exit_code}}));
 }
-
-Status DurableControlPlane::append(std::uint8_t type, const std::string& payload) {
+Status DurableControlPlane::append(std::uint8_t type,
+                                   const std::string &payload) {
+  try {
+    decode(type, payload);
+  } catch (const std::exception &) {
+    return {StatusCode::invalid_argument, "invalid durable record fields"};
+  }
   std::lock_guard<std::mutex> lock(mutex_);
   return journal_.append(type, payload);
 }
-
 Status DurableControlPlane::flush() {
   std::lock_guard<std::mutex> lock(mutex_);
   return journal_.sync();
 }
-
 JournalStats DurableControlPlane::stats() const {
   std::lock_guard<std::mutex> lock(mutex_);
   return journal_.stats();
 }
-
-std::vector<Diagnostic> DurableControlPlane::diagnostics() const { return journal_.diagnostics(); }
-
+std::vector<Diagnostic> DurableControlPlane::diagnostics() const {
+  std::lock_guard<std::mutex> lock(mutex_);
+  return journal_.diagnostics();
+}
 } // namespace omnimesh

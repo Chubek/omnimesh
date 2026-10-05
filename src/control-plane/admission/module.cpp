@@ -387,7 +387,7 @@ std::vector<Diagnostic> validate_node(const Node& node) {
 }
 
 std::string encode_workload(const Workload& workload) {
-  const Json document{
+  Json document{
       {"apiVersion", kApiVersion},
       {"kind", "Workload"},
       {"metadata", {{"name", workload.name},
@@ -406,6 +406,7 @@ std::string encode_workload(const Workload& workload) {
                 {"nodeSelector", workload.node_selector},
                 {"retry", {{"maxAttempts", workload.retry.max_attempts},
                            {"backoffMillis", workload.retry.backoff_millis}}}}}};
+  if (workload.platform.architecture.empty()) { document["spec"]["platform"].erase("architecture"); }
   return document.dump();
 }
 
@@ -423,7 +424,7 @@ std::string encode_node(const Node& node) {
                 {"labels", node.labels},
                 {"capabilities", node.capabilities},
                 {"ready", node.ready},
-                {"verified", node.verified}}};
+                {"verified", node.verified}}}};
   return document.dump();
 }
 

@@ -6,6 +6,13 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 option(OMNIMESH_BUILD_TESTS "Build tests" ON)
 option(OMNIMESH_BUILD_DOCS "Build documentation when Doxygen is available" OFF)
 
+if(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux")
+  message(FATAL_ERROR "This implementation regiment currently supports Linux only")
+endif()
+include(CheckCXXSymbolExists)
+check_cxx_symbol_exists(posix_spawn_file_actions_addclosefrom_np "spawn.h"
+  OMNIMESH_HAVE_SPAWN_CLOSEFROM)
+
 find_package(Threads REQUIRED)
 add_library(omnimesh-json INTERFACE)
 target_include_directories(omnimesh-json SYSTEM INTERFACE
@@ -45,6 +52,11 @@ add_library(omnimesh-core STATIC
 target_include_directories(omnimesh-core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(omnimesh-core PUBLIC Threads::Threads PRIVATE omnimesh-json)
 target_compile_options(omnimesh-core PRIVATE -Wall -Wextra -Wpedantic)
+if(OMNIMESH_HAVE_SPAWN_CLOSEFROM)
+  target_compile_definitions(omnimesh-core PRIVATE OMNIMESH_HAVE_SPAWN_CLOSEFROM=1)
+else()
+  message(STATUS "Safe spawn descriptor isolation unavailable; local execution disabled")
+endif()
 
 add_executable(omnimesh tools/main.cpp)
 target_link_libraries(omnimesh PRIVATE omnimesh-core omnimesh-json)

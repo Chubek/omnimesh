@@ -1,5 +1,6 @@
 #pragma once
 #include "omnimesh/status.hpp"
+#include <cstddef>
 #include <cstdint>
 #include <vector>
 namespace omnimesh {
@@ -19,12 +20,13 @@ class ChildProcess {
 public:
   ChildProcess() = default;
   ~ChildProcess();
-  ChildProcess(const ChildProcess&) = delete;
-  ChildProcess& operator=(const ChildProcess&) = delete;
-  Status start(const std::vector<std::string>& arguments);
+  ChildProcess(const ChildProcess &) = delete;
+  ChildProcess &operator=(const ChildProcess &) = delete;
+  Status start(const std::vector<std::string> &arguments);
   Status poll();
   void terminate() noexcept;
-  const ProcessResult& result() const noexcept { return result_; }
+  const ProcessResult &result() const noexcept { return result_; }
+
 private:
   int pid_{-1};
   int output_fd_{-1};

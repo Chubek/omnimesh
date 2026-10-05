@@ -1,5 +1,6 @@
 #pragma once
 
+#include "omnimesh/orchestrator.hpp"
 #include "omnimesh/storage.hpp"
 
 #include <mutex>
@@ -25,38 +26,37 @@ struct RecoveryReport {
   bool status{false};
 };
 
-// Durable control plane: an in-memory allocator and controller whose
-// authoritative facts are mirrored to an append-only journal, and which can be
-// reconstructed from that journal after a restart.
-//
-// Recovery rebuilds accounting from committed records. It cannot recover what
-// was never written: reservations are journaled before the attempt is issued,
-// so a crash between the two produces an adopted reservation for a worker that
-// was never started. Such attempts are reported for operator review rather than
-// silently retried, because retrying could double external side effects.
-//
-// Not safe for concurrent writers: there is no lease or fencing token.
+// Experimental, manually recorded control-plane event journal. Callers must
+// record facts before issuing external operations; this interface does not wrap
+// allocator/controller mutations transactionally and is not wired to the CLI.
+// Recovery requires fresh state; a failed RecoveryReport forbids scheduling.
+// Active recovered attempts remain Unknown until fresh node observations
+// arrive. A file lock excludes concurrent writers; no distributed leases or
+// fencing exist.
 class DurableControlPlane {
 public:
-  Status open(const std::string& directory);
-  RecoveryReport recover(Allocator& allocator, WorkloadController& controller);
+  Status open(const std::string &directory);
+  Status close();
+  RecoveryReport recover(Allocator &allocator, WorkloadController &controller);
 
-  Status record_node(const Node& node);
-  Status record_quota(const std::string& tenant, const TenantQuota& quota);
-  Status record_workload(const Workload& workload);
-  Status record_cancellation(const std::string& workload_id);
-  Status record_reservation(const std::string& task_id, const std::string& node_id,
-                            std::uint32_t attempt_number, std::uint64_t generation);
-  Status record_observation(const Observation& observation);
+  Status record_node(const Node &node);
+  Status record_quota(const std::string &tenant, const TenantQuota &quota);
+  Status record_workload(const Workload &workload);
+  Status record_cancellation(const std::string &workload_id);
+  Status record_reservation(const std::string &task_id,
+                            const std::string &node_id,
+                            std::uint32_t attempt_number,
+                            std::uint64_t generation);
+  Status record_observation(const Observation &observation);
   Status flush();
 
   JournalStats stats() const;
   std::vector<Diagnostic> diagnostics() const;
 
 private:
-  Status append(std::uint8_t type, const std::string& payload);
+  Status append(std::uint8_t type, const std::string &payload);
   Journal journal_;
-  std::mutex mutex_;
+  mutable std::mutex mutex_;
   std::string directory_;
 };
 

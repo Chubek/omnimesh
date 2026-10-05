@@ -1,267 +1,306 @@
 #include "omnimesh/storage.hpp"
-
 #include <cerrno>
 #include <cstring>
 #include <fcntl.h>
+#include <sys/file.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 namespace omnimesh {
 namespace {
-
 constexpr char kMagic[8] = {'O', 'M', 'N', 'J', 'L', '0', '0', '1'};
-constexpr std::size_t kHeaderBytes = sizeof(kMagic) + sizeof(std::uint32_t) +
-                                     sizeof(std::uint64_t);
-// Frame layout, little-endian, fixed width: sequence (u64), payload length
-// (u32), checksum (u64), record type (u32), then the payload bytes.
-constexpr std::size_t kFrameBytes = sizeof(std::uint64_t) + sizeof(std::uint32_t) +
-                                    sizeof(std::uint64_t) + sizeof(std::uint32_t);
-
-Status io_error(const char* what) {
-  return {StatusCode::internal, std::string(what) + ": " + std::strerror(errno)};
+constexpr std::size_t kHeaderBytes = 20;
+constexpr std::size_t kFrameBytes = 24;
+Status io_error(const char *message) {
+  return {StatusCode::internal,
+          std::string(message) + ": " + std::strerror(errno)};
 }
-
-void store_u32(unsigned char* target, std::uint32_t value) {
-  for (int i = 0; i < 4; ++i) {
-    target[i] = static_cast<unsigned char>((value >> (8 * i)) & 0xffu);
+void store(unsigned char *target, std::uint64_t value, unsigned size) {
+  for (unsigned i = 0; i < size; ++i) {
+    target[i] = static_cast<unsigned char>(value >> (8 * i));
   }
 }
-
-void store_u64(unsigned char* target, std::uint64_t value) {
-  for (int i = 0; i < 8; ++i) {
-    target[i] = static_cast<unsigned char>((value >> (8 * i)) & 0xffu);
-  }
-}
-
-std::uint32_t load_u32(const unsigned char* source) {
-  std::uint32_t value = 0;
-  for (int i = 0; i < 4; ++i) {
-    value |= static_cast<std::uint32_t>(source[i]) << (8 * i);
-  }
-  return value;
-}
-
-std::uint64_t load_u64(const unsigned char* source) {
+std::uint64_t load(const unsigned char *source, unsigned size) {
   std::uint64_t value = 0;
-  for (int i = 0; i < 8; ++i) {
+  for (unsigned i = 0; i < size; ++i) {
     value |= static_cast<std::uint64_t>(source[i]) << (8 * i);
   }
   return value;
 }
-
-// Distinguishes a clean end of file from a short read of a torn record.
-bool read_exactly(std::FILE* file, unsigned char* target, std::size_t size) {
-  return std::fread(target, 1, size, file) == size;
+Status corrupt() {
+  return {StatusCode::invalid_argument,
+          "journal corruption or unsupported format; state was preserved"};
 }
-
-Status write_exactly(std::FILE* file, const unsigned char* source, std::size_t size) {
-  if (std::fwrite(source, 1, size, file) == size) {
-    return Status::Ok();
-  }
-  return io_error("journal write failed");
-}
-
-// Rewind to a verified prefix length and drop everything after it, so later
-// appends cannot build on bytes that were never committed.
-Status truncate_tail(std::FILE* file, std::uint64_t size,
-                    std::vector<Diagnostic>& diagnostics) {
-  if (::ftruncate(::fileno(file), static_cast<::off_t>(size)) != 0) {
-    return io_error("journal truncate failed");
-  }
-  if (std::fflush(file) != 0) {
-    return io_error("journal flush failed");
-  }
-  diagnostics.push_back({"$journal", "discarded an unverified trailing record"});
-  return Status::Ok();
-}
-
 } // namespace
-
 std::uint64_t record_checksum(std::uint64_t sequence, std::uint8_t type,
                               std::string_view payload) noexcept {
+  // Retain the checksum seed of journal v1 for on-disk compatibility.
   std::uint64_t hash = 1469598103934665603ULL;
-  const auto mix = [&hash](unsigned char byte) { hash = (hash ^ byte) * 1099511628211ULL; };
-  for (int i = 0; i < 8; ++i) {
-    mix(static_cast<unsigned char>((sequence >> (8 * i)) & 0xffu));
+  const auto mix = [&hash](unsigned char byte) {
+    hash = (hash ^ byte) * 1099511628211ULL;
+  };
+  for (unsigned i = 0; i < 8; ++i) {
+    mix(static_cast<unsigned char>(sequence >> (8 * i)));
   }
   mix(type);
-  for (const char character : payload) {
-    mix(static_cast<unsigned char>(character));
+  for (unsigned char byte : payload) {
+    mix(byte);
   }
   return hash;
 }
-
 Journal::~Journal() { close(); }
-
-Status Journal::open(const std::string& path) {
-  close();
-  path_ = path;
+Status Journal::open(const std::string &path) {
+  auto status = close();
+  if (!status.ok()) {
+    return status;
+  }
   diagnostics_.clear();
   sequence_ = 0;
-  records_ = 0;
-  file_ = std::fopen(path.c_str(), "r+b");
-  const bool fresh = file_ == nullptr;
-  if (fresh) {
-    if (errno != ENOENT) {
-      return io_error("cannot open journal");
-    }
-    file_ = std::fopen(path.c_str(), "w+b");
-    if (!file_) {
-      return io_error("cannot create journal");
-    }
+  bytes_ = 0;
+  faulted_ = false;
+  if (path.empty() || path.size() > 4096 ||
+      path.find('\0') != std::string::npos) {
+    return {StatusCode::invalid_argument, "invalid journal path"};
   }
-  if (fresh) {
-    unsigned char header[kHeaderBytes];
-    std::memcpy(header, kMagic, sizeof(kMagic));
-    store_u32(header + sizeof(kMagic), kJournalVersion);
-    store_u64(header + sizeof(kMagic) + sizeof(std::uint32_t), 0);
-    auto status = write_exactly(file_, header, sizeof(header));
-    if (status.ok()) {
+  const int fd =
+      ::open(path.c_str(), O_CREAT | O_RDWR | O_NOFOLLOW | O_CLOEXEC, 0600);
+  if (fd < 0) {
+    return io_error("cannot open journal");
+  }
+  struct stat info{};
+  if (fstat(fd, &info) != 0 || !S_ISREG(info.st_mode) ||
+      info.st_uid != getuid() || (info.st_mode & 0777) != 0600 ||
+      info.st_nlink != 1) {
+    ::close(fd);
+    return {StatusCode::permission_denied,
+            "journal must be a private regular file owned by this user"};
+  }
+  if (flock(fd, LOCK_EX | LOCK_NB) != 0) {
+    ::close(fd);
+    return {StatusCode::conflict, "journal already has an owner"};
+  }
+  file_ = fdopen(fd, "r+b");
+  if (!file_) {
+    ::close(fd);
+    return io_error("cannot open journal stream");
+  }
+  if (info.st_size == 0) {
+    unsigned char header[kHeaderBytes]{};
+    std::memcpy(header, kMagic, 8);
+    store(header + 8, kJournalVersion, 4);
+    if (std::fwrite(header, 1, sizeof(header), file_) != sizeof(header)) {
+      status = io_error("cannot initialize journal");
+    } else {
       status = sync();
     }
-    if (!status.ok()) {
-      close();
+    if (status.ok()) {
+      const auto slash = path.rfind('/');
+      const auto parent = slash == std::string::npos ? "."
+                          : slash == 0               ? "/"
+                                                     : path.substr(0, slash);
+      const int directory =
+          ::open(parent.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+      if (directory < 0 || fsync(directory) != 0) {
+        status = io_error("cannot sync journal directory");
+      }
+      if (directory >= 0) {
+        ::close(directory);
+      }
     }
-    return status;
   }
-  unsigned char header[kHeaderBytes];
-  if (!read_exactly(file_, header, sizeof(header)) || std::ferror(file_) ||
-      std::memcmp(header, kMagic, sizeof(kMagic)) != 0 ||
-      load_u32(header + sizeof(kMagic)) != kJournalVersion) {
-    close();
-    return {StatusCode::invalid_argument, "journal is not a recognized v1 log"};
-  }
-  sequence_ = load_u64(header + sizeof(kMagic) + sizeof(std::uint32_t));
-  if (std::fseek(file_, 0, SEEK_END) != 0) {
-    close();
-    return io_error("journal seek failed");
-  }
-  return Status::Ok();
-}
-
-Status Journal::append(std::uint8_t type, const std::string& payload) {
-  if (!file_) {
-    return {StatusCode::unavailable, "journal is not open"};
-  }
-  if (payload.empty() || payload.size() > kMaxRecordBytes) {
-    return {StatusCode::invalid_argument, "record payload size is out of bounds"};
-  }
-  const auto status = write_record(type, payload);
-  return status.ok() ? sync() : status;
-}
-
-Status Journal::write_record(std::uint8_t type, const std::string& payload) {
-  const auto sequence = sequence_ + 1;
-  unsigned char frame[kFrameBytes];
-  store_u64(frame, sequence);
-  store_u32(frame + sizeof(std::uint64_t), static_cast<std::uint32_t>(payload.size()));
-  store_u64(frame + sizeof(std::uint64_t) + sizeof(std::uint32_t),
-            record_checksum(sequence, type, payload));
-  store_u32(frame + kFrameBytes - sizeof(std::uint32_t), type);
-  const auto start = std::ftell(file_);
-  auto status = write_exactly(file_, frame, sizeof(frame));
   if (status.ok()) {
-    status = write_exactly(file_, reinterpret_cast<const unsigned char*>(payload.data()), length);
+    status = scan(true);
   }
   if (!status.ok()) {
-    if (start >= 0) {
-      ::ftruncate(::fileno(file_), start);
-      std::fflush(file_);
+    std::fclose(file_);
+    file_ = nullptr;
+  }
+  return status;
+}
+Status Journal::scan(bool repair_tail) {
+  struct stat info{};
+  if (fstat(fileno(file_), &info) != 0) {
+    return io_error("cannot inspect journal");
+  }
+  if (info.st_size > static_cast<off_t>(kMaxJournalBytes)) {
+    return {StatusCode::resource_exhausted, "journal exceeds the 16 MiB limit"};
+  }
+  std::clearerr(file_);
+  if (std::fseek(file_, 0, SEEK_SET) != 0) {
+    return io_error("cannot seek journal");
+  }
+  unsigned char header[kHeaderBytes];
+  if (std::fread(header, 1, sizeof(header), file_) != sizeof(header)) {
+    return std::ferror(file_) ? io_error("cannot read journal header")
+                              : corrupt();
+  }
+  if (std::memcmp(header, kMagic, 8) != 0 ||
+      load(header + 8, 4) != kJournalVersion || load(header + 12, 8) != 0) {
+    return corrupt();
+  }
+  std::uint64_t sequence = 0, position = kHeaderBytes;
+  bool torn = false;
+  while (true) {
+    unsigned char frame[kFrameBytes];
+    const auto count = std::fread(frame, 1, sizeof(frame), file_);
+    if (std::ferror(file_)) {
+      return io_error("cannot read journal frame");
     }
-    return status;
+    if (count == 0) {
+      break;
+    }
+    if (count != sizeof(frame)) {
+      torn = true;
+      break;
+    }
+    if (sequence >= kMaxRecordsPerReplay) {
+      return {StatusCode::resource_exhausted, "journal record limit reached"};
+    }
+    const auto length = load(frame + 8, 4), type = load(frame + 20, 4);
+    if (length == 0 || length > kMaxRecordBytes || type > 255 ||
+        load(frame, 8) != sequence + 1) {
+      return corrupt();
+    }
+    std::string payload(static_cast<std::size_t>(length), '\0');
+    if (std::fread(payload.data(), 1, payload.size(), file_) !=
+        payload.size()) {
+      if (std::ferror(file_)) {
+        return io_error("cannot read journal payload");
+      }
+      torn = true;
+      break;
+    }
+    if (load(frame + 12, 8) != record_checksum(sequence + 1,
+                                               static_cast<std::uint8_t>(type),
+                                               payload)) {
+      return corrupt();
+    }
+    ++sequence;
+    position += kFrameBytes + length;
+  }
+  if (torn) {
+    if (!repair_tail) {
+      return corrupt();
+    }
+    if (ftruncate(fileno(file_), static_cast<off_t>(position)) != 0 ||
+        fsync(fileno(file_)) != 0) {
+      return io_error("cannot discard incomplete journal tail");
+    }
+    if (diagnostics_.size() < 64) {
+      diagnostics_.push_back(
+          {"$journal", "discarded an incomplete trailing record"});
+    }
   }
   sequence_ = sequence;
-  ++records_;
+  bytes_ = position;
+  std::clearerr(file_);
+  if (std::fseek(file_, static_cast<long>(bytes_), SEEK_SET) != 0) {
+    return io_error("cannot seek journal end");
+  }
   return Status::Ok();
 }
-
+Status Journal::append(std::uint8_t type, const std::string &payload) {
+  if (!file_ || faulted_) {
+    return {StatusCode::unavailable,
+            "journal is closed or has an unresolved I/O failure"};
+  }
+  if (payload.empty() || payload.size() > kMaxRecordBytes) {
+    return {StatusCode::invalid_argument,
+            "record payload size is out of bounds"};
+  }
+  if (sequence_ >= kMaxRecordsPerReplay ||
+      bytes_ + kFrameBytes + payload.size() > kMaxJournalBytes) {
+    return {StatusCode::resource_exhausted,
+            "journal capacity reached; compaction is unsupported"};
+  }
+  unsigned char frame[kFrameBytes];
+  store(frame, sequence_ + 1, 8);
+  store(frame + 8, payload.size(), 4);
+  store(frame + 12, record_checksum(sequence_ + 1, type, payload), 8);
+  store(frame + 20, type, 4);
+  if (std::fseek(file_, static_cast<long>(bytes_), SEEK_SET) != 0 ||
+      std::fwrite(frame, 1, sizeof(frame), file_) != sizeof(frame) ||
+      std::fwrite(payload.data(), 1, payload.size(), file_) != payload.size()) {
+    faulted_ = true;
+    return io_error("cannot append journal record");
+  }
+  const auto status = sync();
+  if (!status.ok()) {
+    faulted_ = true;
+    return status;
+  }
+  ++sequence_;
+  bytes_ += kFrameBytes + payload.size();
+  return Status::Ok();
+}
+Status Journal::replay(
+    const std::function<void(std::uint8_t, const std::string &)> &apply) {
+  if (!file_ || faulted_) {
+    return {StatusCode::unavailable,
+            "journal is closed or has an unresolved I/O failure"};
+  }
+  if (!apply) {
+    return {StatusCode::invalid_argument, "replay requires a callback"};
+  }
+  // Verify the entire file before applying any frame. Complete corruption must
+  // never recover a deceptively successful prefix with missing reservations.
+  auto status = sync();
+  if (status.ok()) {
+    status = scan(true);
+  }
+  if (!status.ok()) {
+    faulted_ = true;
+    return status;
+  }
+  if (std::fseek(file_, kHeaderBytes, SEEK_SET) != 0) {
+    return io_error("cannot rewind journal");
+  }
+  for (std::uint64_t index = 0; index < sequence_; ++index) {
+    unsigned char frame[kFrameBytes];
+    if (std::fread(frame, 1, sizeof(frame), file_) != sizeof(frame)) {
+      faulted_ = true;
+      return io_error("journal changed during replay");
+    }
+    std::string payload(static_cast<std::size_t>(load(frame + 8, 4)), '\0');
+    if (std::fread(payload.data(), 1, payload.size(), file_) !=
+        payload.size()) {
+      faulted_ = true;
+      return io_error("journal changed during replay");
+    }
+    try {
+      apply(static_cast<std::uint8_t>(load(frame + 20, 4)), payload);
+    } catch (const std::exception &) {
+      std::fseek(file_, static_cast<long>(bytes_), SEEK_SET);
+      return {StatusCode::invalid_argument,
+              "journal record could not be applied; recovered state must not "
+              "be used"};
+    }
+  }
+  return std::fseek(file_, static_cast<long>(bytes_), SEEK_SET) == 0
+             ? Status::Ok()
+             : io_error("cannot seek journal end");
+}
 Status Journal::sync() {
   if (!file_) {
     return {StatusCode::unavailable, "journal is not open"};
   }
-  if (std::fflush(file_) != 0) {
-    return io_error("journal flush failed");
-  }
-  if (::fsync(::fileno(file_)) != 0) {
-    return io_error("journal fsync failed");
+  if (std::fflush(file_) != 0 || fsync(fileno(file_)) != 0) {
+    faulted_ = true;
+    return io_error("cannot sync journal");
   }
   return Status::Ok();
 }
-
-Status Journal::replay(const std::function<void(std::uint8_t, const std::string&)>& apply) {
-  if (!file_) {
-    return {StatusCode::unavailable, "journal is not open"};
-  }
-  if (std::fseek(file_, 0, SEEK_SET) != 0) {
-    return io_error("journal seek failed");
-  }
-  unsigned char header[kHeaderBytes];
-  if (!read_exactly(file_, header, sizeof(header)) || std::ferror(file_) ||
-      std::memcmp(header, kMagic, sizeof(kMagic)) != 0 ||
-      load_u32(header + sizeof(kMagic)) != kJournalVersion) {
-    return {StatusCode::invalid_argument, "journal is not a recognized v1 log"};
-  }
-  auto expected = load_u64(header + sizeof(kMagic) + sizeof(std::uint32_t));
-  std::uint64_t position = kHeaderBytes;
-  std::uint64_t replayed = 0;
-  while (true) {
-    if (++replayed > kMaxRecordsPerReplay) {
-      return {StatusCode::resource_exhausted, "journal record limit reached during replay"};
-    }
-    unsigned char frame[kFrameBytes];
-    const auto read = std::fread(frame, 1, sizeof(frame), file_);
-    if (read == 0 && std::feof(file_)) {
-      break;
-    }
-    const auto length = load_u32(frame + sizeof(std::uint64_t));
-    if (read != sizeof(frame) || std::ferror(file_) || length == 0 ||
-        length > kMaxRecordBytes) {
-      const auto truncated = truncate_tail(file_, position, diagnostics_);
-      return truncated.ok() ? Status::Ok() : truncated;
-    }
-    std::string payload(length, '\0');
-    if (!read_exactly(file_, reinterpret_cast<unsigned char*>(&payload[0]), length) ||
-        std::ferror(file_)) {
-      const auto truncated = truncate_tail(file_, position, diagnostics_);
-      return truncated.ok() ? Status::Ok() : truncated;
-    }
-    const auto sequence = load_u64(frame);
-    const auto checksum = load_u64(frame + sizeof(std::uint64_t) + sizeof(std::uint32_t));
-    const auto type =
-        static_cast<std::uint8_t>(load_u32(frame + kFrameBytes - sizeof(std::uint32_t)));
-    if (sequence != expected + 1 || checksum != record_checksum(sequence, type, payload)) {
-      // A gap or mismatch after a verified prefix is treated as a torn tail: the
-      // remaining bytes cannot be trusted, so they are discarded rather than applied.
-      const auto truncated = truncate_tail(file_, position, diagnostics_);
-      return truncated.ok() ? Status::Ok() : truncated;
-    }
-    apply(type, payload);
-    expected = sequence;
-    position += kFrameBytes + length;
-  }
-  sequence_ = expected;
-  records_ = expected;
-  return Status::Ok();
-}
-
 Status Journal::close() {
   if (!file_) {
     return Status::Ok();
   }
   const auto status = sync();
-  std::fclose(file_);
+  const int closed = std::fclose(file_);
   file_ = nullptr;
-  return status;
+  return status.ok() && closed != 0 ? io_error("cannot close journal") : status;
 }
-
-JournalStats Journal::stats() const {
-  std::uint64_t bytes = 0;
-  if (file_) {
-    const auto position = std::ftell(file_);
-    bytes = position > 0 ? static_cast<std::uint64_t>(position) : 0;
-  }
-  return {sequence_, bytes, records_};
+JournalStats Journal::stats() const { return {sequence_, bytes_, sequence_}; }
+const std::vector<Diagnostic> &Journal::diagnostics() const {
+  return diagnostics_;
 }
-
-const std::vector<Diagnostic>& Journal::diagnostics() const { return diagnostics_; }
-
 } // namespace omnimesh

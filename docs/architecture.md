@@ -1,6 +1,6 @@
 # OmniMesh architecture
 
-The scaffold separates control plane (desired state, admission, scheduling and
+The implementation separates control plane (desired state, admission, scheduling and
 allocation) from execution plane (node agents, workers, resources and
 monitoring). Supporting services, runtimes, extensions and common interfaces
 remain independently replaceable.
@@ -56,12 +56,41 @@ count (256), retries (16), backoff (60000 ms), manifest size (1 MiB), nesting
 (32), tokens (16384), diagnostics (64) and reported node rejections are all
 explicitly bounded.
 
-## Not implemented
+## Local execution path
 
-The execution plane, artifact and spool storage, networking, discovery and
-membership, API boundary authentication, durable storage, controller failover,
-telemetry, extensions, and the Omnirun/Omnibuild/OmniVMM/Omnix/Initsys/Meshbox
-runtime remain unimplemented. `WorkloadController` and `Allocator` are
-process-local with no persistence, leases or fencing tokens; running two control
-planes over shared state would overcommit resources. `docs/status.md` records
-these limitations.
+```
+node-agent CLI -> controller -> allocator -> private OCI bundle -> runtime run
+                     ^                                  |             |
+                     +---- ordered state observations <-+--- state ---+
+```
+
+`execute_local` operates on trusted local inventory and a provisioned rootfs.
+It reserves one worker at a time and issues `begin_start` before invoking the
+runtime. Runtime state provides execution acknowledgment. A stopped state must
+match the container identity before terminal observation releases accounting.
+Cancellation updates desired state before TERM/KILL; uncertain termination
+retains accounting and blocks another session for the host user.
+
+`ChildProcess` owns its subprocess and uses direct argv, a minimal environment,
+closed inherited descriptors, nonblocking bounded output capture and bounded
+reaping. Runtime control commands have two-second deadlines. Each session
+uses a new private directory; a synced marker in the authority lock file acts
+as a manual recovery barrier after process death. This is local coordination,
+not distributed fencing or a durable allocation database.
+
+## Journal boundary
+
+`Journal` provides bounded, single-writer version-one event framing and rejects
+complete corruption before replay. `DurableControlPlane` revalidates manifests
+and restores manually recorded reservations as Unknown. Neither CLI uses this
+interface; live controller mutations are not transactionally journaled. Recovery
+failure forbids scheduling against its partially reconstructed state.
+
+## Planned subsystems
+
+Artifact and spool storage, OCI image loading, distributed networking, discovery
+and membership, API authentication, transactional persistent controllers,
+controller failover, telemetry, extensions, and Omnibuild/OmniVMM/Omnix/Initsys/
+Meshbox remain unimplemented. The Omnirun boundary now contains a local OCI
+runtime adapter. `docs/status.md` and `docs/second-regiment.md` document tested
+behavior, compatibility limitations and manual recovery.
